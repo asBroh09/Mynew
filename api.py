@@ -1671,9 +1671,14 @@ async def validate_card(
                     return _r("ORDER_PLACED", charged="True", approved="True")
                 
                 if rtype == "ActionRequiredReceipt":
-                    action = receipt.get("action") or {}
-                    reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
-                    return _r(f"3DS_REQUIRED ({reason})", approved="True")
+    action = receipt.get("action") or {}
+    reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
+    
+    # 🌟 CompletePaymentChallenge-কে OTP Required বানানোর লজিক
+    if "CompletePaymentChallenge" in str(reason):
+        reason = "OTP Required"
+        
+    return _r(f"3DS_REQUIRED ({reason})", approved="True")
                 
                 if rtype == "FailedReceipt":
                     pe      = receipt.get("processingError") or {}
@@ -1715,9 +1720,14 @@ async def validate_card(
                                 return _r("ORDER_PLACED", charged="True", approved="True")
                                 
                             if pt == "ActionRequiredReceipt":
-                                action = pd.get("action") or {}
-                                reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
-                                return _r(f"3DS_REQUIRED ({reason})", approved="True")
+    action = pd.get("action") or {}
+    reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
+    
+    # 🌟 পোলিং স্টেপেও OTP Required দেখানোর লজিক
+    if "CompletePaymentChallenge" in str(reason):
+        reason = "OTP Required"
+        
+    return _r(f"3DS_REQUIRED ({reason})", approved="True")
                                 
                             if pt == "FailedReceipt":
                                 pe      = pd.get("processingError") or {}
