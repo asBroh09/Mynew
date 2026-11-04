@@ -47,13 +47,13 @@ from fastapi.responses import JSONResponse
 # Configuration from environment
 # ---------------------------------------------------------------------------
 PORT             = int(os.environ.get("PORT", 8080))
-WORKERS          = int(os.environ.get("WORKERS", 8))
+WORKERS          = int(os.environ.get("WORKERS", 2))
 CARDS_FILE       = os.environ.get("CARDS_FILE", "cards.txt")
 MAX_PRICE        = float(os.environ.get("MAX_PRICE", 3.0))
 MIN_PRICE        = float(os.environ.get("MIN_PRICE", 0.50))
 SITE_CONCURRENCY = int(os.environ.get("SITE_CONCURRENCY", 100))
-POOL_SIZE        = int(os.environ.get("POOL_SIZE", 3000))
-POOL_PER_HOST    = int(os.environ.get("POOL_PER_HOST", 150))
+POOL_SIZE        = int(os.environ.get("POOL_SIZE", 500))
+POOL_PER_HOST    = int(os.environ.get("POOL_PER_HOST", 50))
 CONNECT_TIMEOUT  = float(os.environ.get("CONNECT_TIMEOUT", 8))
 REQUEST_TIMEOUT  = float(os.environ.get("REQUEST_TIMEOUT", 30))
 CACHE_TTL        = float(os.environ.get("CACHE_TTL", 600))
