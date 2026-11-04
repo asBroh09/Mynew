@@ -1,0 +1,1 @@
+web: python -m uvicorn api:app --host 0.0.0.0 --port $PORT --workers 4 --loop uvloop --http httptools --no-access-log --timeout-keep-alive 60 --limit-concurrency 10000 --limit-max-requests 500000 --backlog 8192
