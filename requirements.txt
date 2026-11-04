@@ -1,5 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 uvloop
 curl_cffi
 orjson
+faker
