@@ -3,9 +3,6 @@ Endpoints:
   GET /shopify?site={site}&cc={card}&proxy={proxy}
   GET /check?site={site}&card={card}&proxy={proxy}
   GET /health
-
-Card formats:  cc|mm|yy|cvv  or  cc|mm|yyyy|cvv
-Proxy formats: ip:port  |  ip:port:user:pass  |  host:port:user:pass  |  scheme://...
 """
 
 import asyncio
@@ -478,7 +475,7 @@ async def lifespan(app: FastAPI):
     global _shared_session
     _shared_session = AsyncSession(impersonate="chrome", timeout=REQUEST_TIMEOUT)
     _reload_cards()
-    log.warning("Shopify Validator API started pool=%d/host concurrency=%d/site", 500, SITE_CONCURRENCY)
+    log.warning("Shopify Validator API started pool=500/host concurrency=%d/site", SITE_CONCURRENCY)
     yield
     if _shared_session:
         res = _shared_session.close()
@@ -570,7 +567,6 @@ def _parse_proxy(raw: Optional[str]) -> Optional[dict]:
         else:
             return None
     
-    # curl_cffi requires proxies as a dictionary
     return {"http": proxy_url, "https": proxy_url}
 
 
